@@ -64,6 +64,7 @@ $HW vacation-request --start 2026-12-21 [--end 2026-12-24] [--half am|pm] --reas
 $HW vacation-line set --approver 팀장 --ref 동료           # 휴가 결재선 저장(이후 신청에 자동 반영) · show/add/remove/clear
 $HW work status | $HW work in --yes | $HW work out --yes   # 근무 체크(지금 시각으로 기록)
 $HW approval list [--box writer] [--status 진행]           # 전자결재 내 문서·상태 · approval count
+$HW approval line <문서번호>                              # 문서 결재선 · vacation-history --lines 로 내 휴가 내역+결재선
 ```
 
 플러그인 경로는 `~/.claude/plugins/cache/hiworks/hiworks/<버전>/` 입니다.

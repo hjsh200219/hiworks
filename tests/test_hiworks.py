@@ -609,5 +609,48 @@ class SavedLineTests(ApiBase):
         self.assertEqual(json.loads(hiworks.config_file().read_text()), {"email": "a@x.com"})
 
 
+
+class ApprovalLineLookupTests(ApiBase):
+    VIEW = ("<script>ApprovalProcess._documentNo = '9'; ApprovalProcess._firstLine = '100,200'; "
+            "ApprovalProcess._secondLine = ''; ApprovalProcess._thirdLine = '300'; ApprovalProcess._fourthLine = ''; "
+            "ApprovalProcess._approvalMethod = 'BCF'; ApprovalProcess._registerNo = '100';</script>")
+    MISSING = '<script>\nalert("존재하지 않은 문서입니다.");\ndocument.location.href="/x.com/approval/document";</script>'
+
+    def dir_routes(self):
+        return {**HrTests.DIR, "GET /v1/employees": FakeResponse(200, {"data": [
+            {"id": 100, "name": "기안자", "active": "Y"}, {"id": 200, "name": "결재자", "active": "Y"},
+            {"id": 300, "name": "참조자", "active": "Y"}]})}
+
+    def test_lines_map_to_method_letters(self):
+        r = self.dir_routes(); r["GET /approval/document/view/9"] = FakeResponse(200, "")
+        r["GET /approval/document/view/9"].body = self.VIEW.encode()
+        self.serve(r)
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            out = hw.approval_line(9)
+        self.assertEqual((out["approval_method"], out["drafter"]), ("BCF", "기안자"))
+        self.assertEqual([(l["line"], l["role"], [p["name"] for p in l["people"]]) for l in out["lines"]],
+                         [(1, "결재(신청)", ["기안자", "결재자"]), (3, "참조", ["참조자"])])
+
+    def test_missing_document_raises_with_server_message(self):
+        r = self.dir_routes(); r["GET /approval/document/view/8"] = FakeResponse(200, "")
+        r["GET /approval/document/view/8"].body = self.MISSING.encode()
+        self.serve(r)
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            with self.assertRaises(hiworks.HiworksError) as cm:
+                hw.approval_line(8)
+        self.assertIn("존재하지 않은 문서", str(cm.exception))
+
+    def test_history_keeps_rows_when_line_unavailable(self):
+        r = self.dir_routes()
+        r["GET /my-vacations/use-details"] = FakeResponse(200, {"data": [{"document_no": 8, "approval_status": "결재완료",
+            "vacation_types": [{"vacation_type_name": "연차", "days": "2", "date_range_start": "2026-09-28", "date_range_end": "2026-09-29"}]}]})
+        r["GET /approval/document/view/8"] = FakeResponse(200, ""); r["GET /approval/document/view/8"].body = self.MISSING.encode()
+        self.serve(r)
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            h = hw.my_vacation_history(2026, with_lines=True)
+        self.assertEqual((h[0]["start"], h[0]["approval_line"]), ("2026-09-28", None))
+        self.assertIn("존재하지 않은 문서", h[0]["approval_line_error"])
+
+
 if __name__ == "__main__":
     unittest.main()

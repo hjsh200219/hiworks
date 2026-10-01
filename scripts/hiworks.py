@@ -24,6 +24,8 @@
   work status|in|out [--yes]              근무 체크 — 상태, 출근·퇴근 기록(지금 시각, --yes 때만)
   approval list [--box all|writer|approval|refer|read|reading|return|temp] [--status 진행|완료|반려] [--search 말]
   approval count                         전자결재 — 내 문서 목록·상태, 결재할 문서 수
+  approval line <문서번호>               그 문서의 결재선(줄별 역할·사람)
+  vacation-history [--year Y] [--lines]  내 휴가 신청 내역(+결재선)
   vacation-line show|set|add|remove|clear [--approver 이름] [--processor 이름] [--ref 이름]
                                          휴가 결재선 저장 — 휴가 신청 때 자동으로 들어간다(config.json, 아이디로 저장)
   vacation-request --start D [--end D] [--half am|pm] [--reason …] [--yes]
@@ -78,6 +80,11 @@
   (필터 없으면 전부) · GET my-documents/count · GET temp-documents. 상태: list_status(PROGRESS 등)가 있으면 그것,
   없으면 complete_date 가 있으면 완료. 결재할 문서 수: POST approval.office.hiworks.com/{domain}/approval/document_ajax/
   pMenu=get_approval_count(폼 전송) → result.w 대기·e 예정·p 진행·v 확인·a 전체
+- 결재선 조회: 문서 보기 화면 approval.office.hiworks.com/{domain}/approval/document/view/{no} 의 인라인 스크립트
+  ApprovalProcess._firstLine…_sixthLine = '직원번호,…' · _approvalMethod(BCF 등, 글자 순서 = 줄 역할) · _registerNo(기안자).
+  열람 권한이 없거나 없는 문서면 alert("존재하지 않은 문서입니다.") — 2026-10-01 실측: 내 휴가 내역(my-vacations/use-details
+  type R)의 document_no 3건이 모두 이 응답이었다(남이 기안한 휴가 문서는 열린다)
+- 내 휴가 내역: GET hr-work-api /v4/my-vacations/use-details?filter[date][gte]=YYYY-01-01&filter[date][lte]=YYYY-12-31
 - 휴가 신청(hr-work-api /v4, 쓰기 본문은 {"data": …}):
   GET forms/vacation-request/node/{node_id} → 양식 id·보존 기간·보안 등급·기본 결재선 line_users(approval_type B 신청·C 처리·F 참조)
   POST vacation-request-check → available_user_nos·…_exceptions·date_exceptions[].…_users (신청서를 만들지 않는 사전 검사.
@@ -788,6 +795,48 @@ class Hiworks:
             items = [x for x in items if status in (x["status"], x["status_code"])]
         return {"box": box, "count": len(items[:limit]), "items": items[:limit]}
 
+    def approval_line(self, document_no: int) -> dict:
+        """전자결재 문서의 결재선. 문서 보기 화면이 심어 두는 ApprovalProcess._firstLine… 값(직원 번호)을 읽는다.
+        결재 방식(예 BCF)의 글자 순서가 1·2·3번째 줄의 역할이다(B 신청·C 처리·F 참조 — 화면 코드 대조, 서버 문서는 없음)."""
+        r = self._s.get(f"{APPROVAL_ORIGIN}/{self.office_domain}/approval/document/view/{int(document_no)}")
+        h = r.body.decode("utf-8", "ignore")
+        lines = dict(re.findall(r"ApprovalProcess\._(\w+Line) = '([^']*)'", h))
+        if not lines:
+            m = re.search(r'alert\("([^"]+)"\);\s*document\.location', h)
+            raise HiworksError(f"문서 {document_no} 의 결재선을 읽지 못했습니다 — {m.group(1) if m else '보기 화면을 열 수 없음'}")
+        method = (re.search(r"ApprovalProcess\._approvalMethod = '([^']*)'", h) or [None, ""])[1]
+        register = (re.search(r"ApprovalProcess\._registerNo = '([^']*)'", h) or [None, ""])[1]
+        d = self._directory()
+        name = lambda no: (d["people"].get(int(no)) or {}).get("name") if str(no).isdigit() else None
+        out = []
+        for i, key in enumerate(("firstLine", "secondLine", "thirdLine", "fourthLine", "fifthLine", "sixthLine")):
+            nos = [x for x in (lines.get(key) or "").split(",") if x.strip()]
+            if not nos:
+                continue
+            role = method[i] if i < len(method) else None
+            out.append({"line": i + 1, "role": APPROVAL_ROLE.get(role, role) if role else None,
+                        "people": [{"office_user_no": int(n), "name": name(n)} for n in nos]})
+        return {"document_no": int(document_no), "approval_method": method,
+                "drafter": name(register) if register else None, "lines": out}
+
+    def my_vacation_history(self, year: int, with_lines: bool = False) -> list[dict]:
+        """내 휴가 신청 내역(근무/경비처리 > 휴가내역). with_lines 면 결재 문서의 결재선도 붙인다."""
+        r = self._hr_work("GET", f"my-vacations/use-details?filter[date][gte]={int(year)}-01-01&filter[date][lte]={int(year)}-12-31")
+        out = []
+        for x in r.get("data", []):
+            for v in x.get("vacation_types") or [{}]:
+                item = {"start": v.get("date_range_start"), "end": v.get("date_range_end"), "type": v.get("vacation_type_name"),
+                        "days": v.get("days"), "hours": v.get("hours"), "approval_status": x.get("approval_status"),
+                        "document_no": x.get("document_no")}
+                if with_lines and x.get("document_no"):
+                    try:
+                        item["approval_line"] = self.approval_line(x["document_no"])["lines"]
+                    except HiworksError as e:
+                        item["approval_line"] = None
+                        item["approval_line_error"] = str(e)
+                out.append(item)
+        return sorted(out, key=lambda i: i["start"] or "")
+
     def approval_counts(self) -> dict:
         """결재할 문서 수(대기·예정·진행·확인·전체)와 내 문서함 총 건수."""
         r = self._s.post(f"{APPROVAL_ORIGIN}/{self.office_domain}/approval/document_ajax/", retries=1,
@@ -974,8 +1023,16 @@ def run_api_command(hw: "Hiworks", a) -> int:
         y, mo = map(int, ym.split("-"))
         emit({"month": ym, "periods": hw.vacation_calendar(y, mo, name=a.name, department=a.dept)})
     elif a.cmd == "approval":
-        emit(hw.approval_counts() if a.action == "count"
-             else hw.approval_documents(a.box, a.status, a.search, a.limit, a.offset))
+        if a.action == "line":
+            if not a.document_no:
+                raise HiworksError("approval line 에는 문서 번호가 필요합니다.")
+            emit(hw.approval_line(a.document_no))
+        else:
+            emit(hw.approval_counts() if a.action == "count"
+                 else hw.approval_documents(a.box, a.status, a.search, a.limit, a.offset))
+    elif a.cmd == "vacation-history":
+        from datetime import date
+        emit(hw.my_vacation_history(a.year or date.today().year, with_lines=a.lines))
     elif a.cmd == "vacation-line":
         line = saved_vacation_line()
         new = {"approvers": hw.resolve_user_ids(a.approver), "processors": hw.resolve_user_ids(a.processor),
@@ -1163,8 +1220,12 @@ def main() -> int:
     vl.add_argument("--approver", action="append", default=[], help="결재자(B) — 적은 순서가 결재 순서")
     vl.add_argument("--processor", action="append", default=[], help="처리자(C)")
     vl.add_argument("--ref", action="append", default=[], help="참조자(F)")
-    ap2 = sub.add_parser("approval", help="전자결재 — list 문서 목록·상태 · count 건수")
-    ap2.add_argument("action", choices=["list", "count"])
+    vh = sub.add_parser("vacation-history", help="내 휴가 신청 내역(JSON) — --lines 면 결재선도")
+    vh.add_argument("--year", type=int, help="연도(기본 올해)")
+    vh.add_argument("--lines", action="store_true", help="결재 문서의 결재선도 붙인다")
+    ap2 = sub.add_parser("approval", help="전자결재 — list 문서 목록·상태 · count 건수 · line <문서번호> 결재선")
+    ap2.add_argument("action", choices=["list", "count", "line"])
+    ap2.add_argument("document_no", nargs="?", type=int, help="line 때 문서 번호")
     ap2.add_argument("--box", default="all", help="all(기본)·writer 기안·approval 결재·refer 수신·read 회람/참조·reading 열람·return 반려·temp 임시저장")
     ap2.add_argument("--status", help="상태로 거르기 — 진행·완료·반려 등")
     ap2.add_argument("--search", help="제목·내용 등 검색어")
@@ -1210,7 +1271,7 @@ def main() -> int:
                 return 0
             how = hw.ensure(otp)
             if a.cmd in ("mail", "vacation", "leave-calendar", "org", "person", "vacation-request", "work",
-                         "approval", "vacation-line"):
+                         "approval", "vacation-line", "vacation-history"):
                 return run_api_command(hw, a)
             if a.cmd == "session":
                 print(f"{'저장 세션 재사용' if how == 'reused' else '새로 로그인'} · {hw.username}")

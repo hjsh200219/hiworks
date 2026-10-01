@@ -1,6 +1,6 @@
 ---
 name: hiworks
-description: 하이웍스(Hiworks) 로그인 세션을 브라우저 없이 만들고 재사용하며(Scrapling) 메일 읽기·쓰기·삭제, 내 잔여 휴가, 전사 휴가 캘린더(다른 사람 휴가 기간), 조직도·직원 조회를 JSON 으로 돌려준다. 트리거 — "/hiworks", "하이웍스 로그인", "하이웍스 메일", "메일 보내줘", "메일 지워줘", "받은 메일", "잔여 휴가", "남은 연차", "누구 휴가", "휴가 캘린더", "조직도", "OO 연락처", "OO 부서", "휴가 신청", "연차 써줘", "반차 신청", "결재선", "출근", "퇴근", "근무 체크", "전자결재", "결재 문서", "결재 대기". 자격증명이 없으면 그 자리에서 setup 을 실행한다.
+description: 하이웍스(Hiworks) 로그인 세션을 브라우저 없이 만들고 재사용하며(Scrapling) 메일 읽기·쓰기·삭제, 내 잔여 휴가, 전사 휴가 캘린더(다른 사람 휴가 기간), 조직도·직원 조회를 JSON 으로 돌려준다. 트리거 — "/hiworks", "하이웍스 로그인", "하이웍스 메일", "메일 보내줘", "메일 지워줘", "받은 메일", "잔여 휴가", "남은 연차", "누구 휴가", "휴가 캘린더", "조직도", "OO 연락처", "OO 부서", "휴가 신청", "연차 써줘", "반차 신청", "결재선", "출근", "퇴근", "근무 체크", "전자결재", "결재 문서", "결재 대기", "휴가 내역", "결재선 조회", "이전 결재선". 자격증명이 없으면 그 자리에서 setup 을 실행한다.
 argument-hint: "[mail|vacation|vacation-request|vacation-line|leave-calendar|org|person|work|approval|status|check|session|forget]"
 allowed-tools: Bash(uv run:*)
 ---
@@ -28,6 +28,8 @@ allowed-tools: Bash(uv run:*)
 | `HW org` | 조직도 — 부서 트리와 구성원(이름·직위·직책) | GET |
 | `HW vacation-request --start D [--end D] [--type 연차] [--half am\|pm] [--start-time HH:MM --end-time HH:MM] [--reason 사유] [--approver 이름] [--processor 이름] [--ref 이름] [--no-saved-line] [--yes]` | 휴가 신청. 결재선은 양식 기본선 + 저장한 결재선 + 이번 추가분. **`--yes` 없으면 서버 사전 검사 + 미리보기만** | POST |
 | `HW vacation-line show\|set\|add\|remove\|clear [--approver 이름] [--processor 이름] [--ref 이름]` | 휴가 결재선 저장·수정·삭제 — 이후 휴가 신청에 자동으로 들어간다 | 로컬 |
+| `HW vacation-history [--year Y] [--lines]` | 내 휴가 신청 내역(+결재 문서 결재선) | GET |
+| `HW approval line <문서번호>` | 전자결재 문서의 결재선(줄별 역할·사람) — 문서를 열 수 있을 때만 | GET |
 | `HW work status` · `HW work in\|out [--yes]` | 근무 체크 상태 · 출근/퇴근 기록(지금 시각). **`--yes` 없으면 미리보기만** | GET·POST |
 | `HW approval list [--box all\|writer\|approval\|refer\|read\|reading\|return\|temp] [--status 진행\|완료\|반려] [--search 말]` · `HW approval count` | 전자결재 내 문서 목록과 상태 · 결재할 문서 수 | GET |
 | `HW person <이름\|아이디>` | 직원 찾기 — 부서·직위·회사 전화, 본인이 공개한 경우만 휴대폰·이메일·입사일 | GET |
