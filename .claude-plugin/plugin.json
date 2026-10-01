@@ -1,7 +1,7 @@
 {
   "name": "hiworks",
-  "version": "0.6.0",
-  "description": "하이웍스(Hiworks) 로그인 세션(Scrapling) + 메일 읽기·쓰기·삭제, 휴가 조회·신청·결재선 저장, 출근·퇴근 체크, 전자결재 문서 조회, 조직도·직원 조회 JSON API. 비밀번호는 OS 키체인.",
+  "version": "0.7.0",
+  "description": "하이웍스(Hiworks) 로그인 세션(Scrapling) + 메일(첨부·답장·전달), 휴가 조회·신청·취소·결재선, 일정, 아침 요약, 출퇴근 체크, 전자결재 조회, 조직도 JSON API. 비밀번호는 OS 키체인.",
   "author": {
     "name": "hjsh200219",
     "url": "https://github.com/hjsh200219"

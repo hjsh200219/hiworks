@@ -1,7 +1,7 @@
 ---
 name: hiworks
-description: 하이웍스(Hiworks) 로그인 세션을 브라우저 없이 만들고 재사용하며(Scrapling) 메일 읽기·쓰기·삭제, 내 잔여 휴가, 전사 휴가 캘린더(다른 사람 휴가 기간), 조직도·직원 조회를 JSON 으로 돌려준다. 트리거 — "/hiworks", "하이웍스 로그인", "하이웍스 메일", "메일 보내줘", "메일 지워줘", "받은 메일", "잔여 휴가", "남은 연차", "누구 휴가", "휴가 캘린더", "조직도", "OO 연락처", "OO 부서", "휴가 신청", "연차 써줘", "반차 신청", "결재선", "출근", "퇴근", "근무 체크", "전자결재", "결재 문서", "결재 대기", "휴가 내역", "결재선 조회", "이전 결재선". 자격증명이 없으면 그 자리에서 setup 을 실행한다.
-argument-hint: "[mail|vacation|vacation-request|vacation-line|leave-calendar|org|person|work|approval|status|check|session|forget]"
+description: 하이웍스(Hiworks) 로그인 세션을 브라우저 없이 만들고 재사용하며(Scrapling) 메일 읽기·쓰기·삭제, 내 잔여 휴가, 전사 휴가 캘린더(다른 사람 휴가 기간), 조직도·직원 조회를 JSON 으로 돌려준다. 트리거 — "/hiworks", "하이웍스 로그인", "하이웍스 메일", "메일 보내줘", "메일 지워줘", "받은 메일", "잔여 휴가", "남은 연차", "누구 휴가", "휴가 캘린더", "조직도", "OO 연락처", "OO 부서", "휴가 신청", "연차 써줘", "반차 신청", "결재선", "출근", "퇴근", "근무 체크", "전자결재", "결재 문서", "결재 대기", "휴가 내역", "결재선 조회", "이전 결재선", "휴가 취소", "일정", "캘린더", "회의 잡아줘", "오늘 요약", "아침 브리핑", "첨부파일", "답장", "전달". 자격증명이 없으면 그 자리에서 setup 을 실행한다.
+argument-hint: "[today|mail|calendar|vacation|vacation-request|vacation-cancel|vacation-line|leave-calendar|org|person|work|approval|status|check|session|forget]"
 allowed-tools: Bash(uv run:*)
 ---
 
@@ -28,6 +28,10 @@ allowed-tools: Bash(uv run:*)
 | `HW org` | 조직도 — 부서 트리와 구성원(이름·직위·직책) | GET |
 | `HW vacation-request --start D [--end D] [--type 연차] [--half am\|pm] [--start-time HH:MM --end-time HH:MM] [--reason 사유] [--approver 이름] [--processor 이름] [--ref 이름] [--no-saved-line] [--yes]` | 휴가 신청. 결재선은 양식 기본선 + 저장한 결재선 + 이번 추가분. **`--yes` 없으면 서버 사전 검사 + 미리보기만** | POST |
 | `HW vacation-line show\|set\|add\|remove\|clear [--approver 이름] [--processor 이름] [--ref 이름]` | 휴가 결재선 저장·수정·삭제 — 이후 휴가 신청에 자동으로 들어간다 | 로컬 |
+| `HW today` | 아침 요약 — 안 읽은 메일·결재할 문서 수·오늘 일정·근무 체크·오늘 쉬는 팀원 | GET |
+| `HW mail send … [--attach 파일]… [--reply-to 번호 \| --forward 번호]` · `HW mail attachment <번호> <part_id\|all> [--dest 폴더]` | 첨부 보내기·답장·전달(원본 첨부 포함) · 첨부 받기 | POST·GET |
+| `HW calendar list [--from D --to D]` · `HW calendar add --title T --start 'YYYY-MM-DD HH:MM' [--end …] [--all-day] [--yes]` · `HW calendar delete <id> --date D [--yes]` | 일정 조회·등록·삭제(등록·삭제는 미리보기 뒤 --yes) | GET·POST·DELETE |
+| `HW vacation-cancel --start D [--end D] [--reason 사유] [--yes]` | 휴가 취소 신청. **`--yes` 없으면 미리보기만** | POST |
 | `HW vacation-history [--year Y] [--lines]` | 내 휴가 신청 내역(+결재 문서 결재선) | GET |
 | `HW approval line <문서번호>` | 전자결재 문서의 결재선(줄별 역할·사람) — 문서를 열 수 있을 때만 | GET |
 | `HW work status` · `HW work in\|out [--yes]` | 근무 체크 상태 · 출근/퇴근 기록(지금 시각). **`--yes` 없으면 미리보기만** | GET·POST |
@@ -61,7 +65,7 @@ allowed-tools: Bash(uv run:*)
 - `check.ok` 가 false 면 신청하지 않는다(`--yes` 도 막힌다). `problems` 를 한국어로 전한다.
 - `warning`(추정 일수 > 잔여)이 있으면 그대로 알리고 계속할지 묻는다 — 서버는 잔여 초과를 막지 않았다.
 - 실패해도 자동으로 다시 신청하지 않는다. `leave-calendar --name 내이름` 으로 들어갔는지 먼저 본다.
-- 취소는 아직 없다 — 하이웍스 근무/경비처리 화면에서 한다.
+- 취소는 `vacation-cancel` — 신청과 같이 미리보기를 보여 주고 사용자가 취소하라고 한 뒤에만 `--yes`. 취소도 결재선에 알림이 간다.
 - 결재선 추가는 `--approver`(신청 라인 결재자, 적은 순서가 결재 순서)·`--processor`(처리)·`--ref`(참조). 같은 이름이 여럿이면 아이디로 다시 지정하게 안내한다.
 - 늘 같은 결재선이면 `vacation-line set …` 으로 저장해 두라고 권한다. 저장한 결재선을 빼고 신청하려면 `--no-saved-line`.
 

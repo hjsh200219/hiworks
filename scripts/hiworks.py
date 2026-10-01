@@ -25,6 +25,10 @@
   approval list [--box all|writer|approval|refer|read|reading|return|temp] [--status 진행|완료|반려] [--search 말]
   approval count                         전자결재 — 내 문서 목록·상태, 결재할 문서 수
   approval line <문서번호>               그 문서의 결재선(줄별 역할·사람)
+  mail send … [--attach 파일] [--reply-to N | --forward N]  첨부·답장·전달 · mail attachment <no> <part|all>
+  vacation-cancel --start D [--end D] [--reason …] [--yes]  휴가 취소 신청(--yes 때만)
+  calendar list|add|delete|calendars     일정 조회·등록·삭제(add·delete 는 --yes 때만)
+  today                                  아침 요약 — 안 읽은 메일·결재할 문서·오늘 일정·근무 체크·오늘 쉬는 팀원
   vacation-history [--year Y] [--lines]  내 휴가 신청 내역(+결재선)
   vacation-line show|set|add|remove|clear [--approver 이름] [--processor 이름] [--ref 이름]
                                          휴가 결재선 저장 — 휴가 신청 때 자동으로 들어간다(config.json, 아이디로 저장)
@@ -84,6 +88,15 @@
   ApprovalProcess._firstLine…_sixthLine = '직원번호,…' · _approvalMethod(BCF 등, 글자 순서 = 줄 역할) · _registerNo(기안자).
   열람 권한이 없거나 없는 문서면 alert("존재하지 않은 문서입니다.") — 2026-10-01 실측: 내 휴가 내역(my-vacations/use-details
   type R)의 document_no 3건이 모두 이 응답이었다(남이 기안한 휴가 문서는 열린다)
+- 첨부: POST mail-api /v2/mails/temp-attachments (multipart mail_serial=그 발송의 cert_key, file) 뒤 send · 받기 GET
+  /v2/mails/{no}/attachments/{part_id}. 답장 is_reply·original_mail_no·response_target_mail_no, 전달 is_forward·
+  original_mail_no·original_temp_part_id_list=[원본 part_id](원본 첨부가 따라간다 — 2026-10-01 Gmail 수신 확인)
+- 일정: schedule-api.office.hiworks.com · GET projects?project_type=PERSONAL|SHARED · GET schedules?start_date&end_date
+  (YYYY-MM-DD) · POST projects/{id}/schedules multipart request(JSON, start/end UTC "…Z") · DELETE projects/{id}/schedules/{sid}
+  ?target_date=YYYY-MM-DD&delete_type=NONE(반복이면 그날만)
+- 휴가 취소: GET hr-work-api /v4/vacation-request-calendar?filter[date][gte|lte]&filter[user_no]&filter[my-vacation-flag ]=Y
+  → calendar_data[].vacation_request_details[].request_detail_id · POST vacation-cancel {"data": 신청 양식·결재선 + year +
+  vacation_request_detail_nos}
 - 내 휴가 내역: GET hr-work-api /v4/my-vacations/use-details?filter[date][gte]=YYYY-01-01&filter[date][lte]=YYYY-12-31
 - 휴가 신청(hr-work-api /v4, 쓰기 본문은 {"data": …}):
   GET forms/vacation-request/node/{node_id} → 양식 id·보존 기간·보안 등급·기본 결재선 line_users(approval_type B 신청·C 처리·F 참조)
@@ -117,6 +130,8 @@ MAIL_ORIGIN = "https://mails.office.hiworks.com"
 TRASH_MAILBOX = "b5"
 HR_ORIGIN = "https://hr-work.office.hiworks.com"
 CACHE_API = "https://cache-api.office.hiworks.com"
+SCHEDULE_API = "https://schedule-api.office.hiworks.com"
+SCHEDULE_ORIGIN = "https://scheduler.office.hiworks.com"
 WORK_API = "https://work-api.office.hiworks.com"
 HR_API = "https://hr-api.office.hiworks.com"
 HR_WORK_API = "https://hr-work-api.office.hiworks.com/v4"
@@ -490,31 +505,94 @@ class Hiworks:
         msg = m.get("message") or {}
         out["content_html"] = msg.get("content", "")
         out["content_text"] = html_to_text(msg.get("content", ""))
-        out["attachments"] = [{k: a.get(k) for k in ("part_id", "name", "size", "content_type") if k in a}
-                              for a in msg.get("attachments", [])]
+        out["attachments"] = [summarize_attachment(a) for a in msg.get("attachments", [])]
         return out
 
-    def send_mail(self, to, subject: str, content: str, cc=(), bcc=(), html: bool = False) -> dict:
-        """메일 발송. 실패해도 재시도하지 않는다 — 서버가 받은 뒤 끊긴 경우 다시 보내면 두 통이 된다."""
+    def _raw(self, method: str, url: str, origin: str, *, multipart=None, accept: str = "application/json",
+             want_bytes: bool = False):
+        """scrapling 세션이 못 하는 멀티파트 전송·DELETE·파일 받기 — 같은 쿠키를 쓰는 내부 curl_cffi 세션을 직접 쓴다
+        (scrapling 0.4.11 기준 비공개 속성 — 쿠키 저장과 같은 이유로 여기 한 곳에만 둔다). 재시도 없음."""
+        kw = {"headers": {"Origin": origin, "Referer": f"{origin}/", "accept": accept}, "impersonate": "chrome"}
+        if multipart is not None:
+            from curl_cffi import CurlMime
+            mp = CurlMime()
+            for name, filename, ctype, data in multipart:
+                mp.addpart(name=name, filename=filename, content_type=ctype, data=data)
+            kw["multipart"] = mp
+        r = getattr(self._s._curl_session, method.lower())(url, **kw)
+        if want_bytes and r.status_code < 400:
+            return r
+        try:
+            data = r.json() if r.content else {}
+        except ValueError:
+            data = {}
+        if r.status_code >= 400:
+            err = ((data.get("errors") or [{}])[0] or {}) if isinstance(data, dict) and isinstance(data.get("errors"), list) else {}
+            raise HiworksApiError(r.status_code, err.get("title"), err.get("message"))
+        return data
+
+    def download_attachment(self, no: int, part_id: str, dest: Path) -> Path:
+        """메일 첨부파일 하나를 dest 폴더에 받는다. 파일 이름은 메일에 적힌 이름(겹치면 번호를 붙인다)."""
+        meta = next((a for a in self.get_mail(no)["attachments"] if str(a["part_id"]) == str(part_id)), None)
+        if meta is None:
+            raise HiworksError(f"메일 {no} 에 첨부 {part_id} 가 없습니다.")
+        r = self._raw("GET", f"{MAIL_API}/mails/{int(no)}/attachments/{part_id}", MAIL_ORIGIN, accept="*/*", want_bytes=True)
+        dest.mkdir(parents=True, exist_ok=True)
+        name = Path(meta.get("name") or f"attachment-{part_id}").name
+        path, i = dest / name, 1
+        while path.exists():
+            path, i = dest / f"{Path(name).stem} ({i}){Path(name).suffix}", i + 1
+        path.write_bytes(r.content)
+        return path
+
+    def send_mail(self, to, subject: str | None, content: str, cc=(), bcc=(), html: bool = False,
+                  attachments=(), reply_to: int | None = None, forward_of: int | None = None) -> dict:
+        """메일 발송. 실패해도 재시도하지 않는다 — 서버가 받은 뒤 끊긴 경우 다시 보내면 두 통이 된다.
+        attachments 는 로컬 파일 경로들. reply_to·forward_of 에 메일 번호를 주면 답장·전달(원문 인용, 전달은 원본 첨부 포함)."""
         to, cc, bcc = as_list(to), as_list(cc), as_list(bcc)
         if not to:
             raise HiworksError("받는 사람(to)이 비었습니다.")
+        if reply_to and forward_of:
+            raise HiworksError("답장과 전달은 함께 할 수 없습니다.")
+        files = [Path(f).expanduser() for f in as_list(attachments)]
+        missing = [str(f) for f in files if not f.is_file()]
+        if missing:
+            raise HiworksError("첨부할 파일이 없습니다: " + ", ".join(missing))
+        content_html = content if html else text_to_html(content)
+        orig_no = reply_to or forward_of
+        orig_parts: list = []
+        if orig_no:
+            orig = self.get_mail(orig_no)
+            prefix = "RE: " if reply_to else "FW: "
+            if not subject:
+                subject = prefix + (orig.get("subject") or "")
+            content_html += quote_original(orig)
+            if forward_of:
+                orig_parts = [a["part_id"] for a in orig["attachments"] if a.get("part_id") is not None]
         cert_key = self._mail("POST", "/mails/cert-key").get("data")
         senders = self._mail("GET", "/senders").get("data", [])  # sender_no 는 주소 번호가 아니라 발신자 번호(/senders 의 no)
         sender = next((x for x in senders if x.get("is_default")), senders[0] if senders else None)
         if not cert_key or sender is None:
             raise HiworksError("발송 준비(cert-key·보내는 사람)를 받지 못했습니다.")
+        uploaded = []
+        for f in files:  # 첨부는 이번 발송의 cert_key 를 mail_serial 로 묶어 임시 보관함에 먼저 올린다
+            import mimetypes
+            ctype = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
+            self._raw("POST", f"{MAIL_API}/mails/temp-attachments", MAIL_ORIGIN,
+                      multipart=[("mail_serial", None, None, str(cert_key).encode()), ("file", f.name, ctype, f.read_bytes())])
+            uploaded.append(f.name)
         body = {
             "cert_key": cert_key, "sender_no": sender["no"], "to": to, "cc": cc, "bcc": bcc,
-            "subject": subject or "[제목없음]", "content": content if html else text_to_html(content),
-            "is_important": False, "original_mail_no": None, "original_temp_part_id_list": [],
+            "subject": subject or "[제목없음]", "content": content_html,
+            "is_important": False, "original_mail_no": orig_no, "original_temp_part_id_list": orig_parts,
             "is_encrypt": False, "is_separate_send": False, "reserve_date": None, "is_text_mode": False,
-            "is_reply": False, "is_forward": False, "response_target_mail_no": None,
+            "is_reply": bool(reply_to), "is_forward": bool(forward_of), "response_target_mail_no": reply_to,
             "is_receipt_confirm": True, "is_save": True,
         }
         d = self._mail("POST", "/mails/send", body).get("data") or {}
         return {"sent": True, "from": sender.get("address"), "to": to, "cc": cc, "bcc": bcc, "subject": body["subject"],
-                "send_type": d.get("send_type")}
+                "attachments": uploaded, "forwarded_attachments": len(orig_parts),
+                "reply_to": reply_to, "forward_of": forward_of, "send_type": d.get("send_type")}
 
     def delete_mails(self, nos, permanent: bool = False) -> dict:
         """기본은 휴지통(b5)으로 이동. permanent=True 면 완전 삭제(복구 불가)."""
@@ -748,6 +826,126 @@ class Hiworks:
         self._hr_work("POST", "vacation-request", payload)
         return {"requested": True, "details": payload.get("details") or payload.get("period_selections")}
 
+    def my_vacation_days(self, start: str, end: str) -> list[dict]:
+        """start~end 사이 내 휴가(신청 상세 번호 포함) — 취소할 대상을 고르는 데 쓴다."""
+        no = self.me()["office_user_no"]
+        q = (f"vacation-request-calendar?filter[date][gte]={start}&filter[date][lte]={end}&filter[user_no]={no}"
+             f"&filter[my-vacation-flag ]=Y&page[limit]=100&page[offset]=0")  # 'my-vacation-flag ' 뒤 공백은 화면 코드 그대로
+        out = []
+        for cell in (self._hr_work("GET", q).get("data") or {}).get("calendar_data") or []:
+            for v in cell.get("vacation_request_details") or []:
+                out.append({"date": cell.get("date"), "detail_no": v.get("request_detail_id"), "type": v.get("vacation_type_title"),
+                            "time_type": v.get("time_type"), "days": v.get("days"), "hours": v.get("hours"),
+                            "start_time": v.get("start_time"), "end_time": v.get("end_time")})
+        return out
+
+    def vacation_cancel_payload(self, start: str, end: str | None = None, reason: str = "",
+                                department: str | None = None, use_saved_line: bool = True) -> tuple[dict, list[dict]]:
+        """휴가 취소 본문(보내지 않음)과 취소될 날짜 목록. 결재선은 휴가 신청과 같은 양식·기본선·저장 결재선."""
+        days = self.my_vacation_days(start, end or start)
+        if not days:
+            raise HiworksError(f"{start}~{end or start} 에 취소할 내 휴가가 없습니다.")
+        base = self.vacation_request_payload(start, end, reason=reason, department=department, use_saved_line=use_saved_line)
+        payload = {k: base[k] for k in ("form_id", "node_id", "preserved_term", "security_level", "comment", "line_users")}
+        payload["year"] = start[:4]
+        payload["vacation_request_detail_nos"] = [d["detail_no"] for d in days]
+        return payload, days
+
+    def cancel_vacation(self, payload: dict) -> dict:
+        """휴가 취소 신청을 실제로 올린다 — 결재선에 알림이 간다. 재시도 없음."""
+        if not payload.get("vacation_request_detail_nos"):
+            raise HiworksError("취소할 휴가가 없습니다.")
+        self._hr_work("POST", "vacation-cancel", payload)
+        return {"cancel_requested": True, "detail_nos": payload["vacation_request_detail_nos"]}
+
+    # ---------- 일정(캘린더) ----------
+
+    def calendars(self) -> list[dict]:
+        """내가 볼 수 있는 캘린더 — 개인(PERSONAL)·공유(SHARED)."""
+        out = []
+        for kind in ("PERSONAL", "SHARED"):
+            for c in self._api("GET", f"{SCHEDULE_API}/projects?project_type={kind}", SCHEDULE_ORIGIN).get("data", []):
+                out.append({"id": c.get("id"), "type": kind, "name": c.get("title") or c.get("name"),
+                            "writable": c.get("has_write_permission")})
+        return out
+
+    def schedules(self, start: str, end: str) -> list[dict]:
+        """start~end(YYYY-MM-DD, 끝 날짜 포함) 일정. 시각은 이 컴퓨터의 시간대로 바꿔 보여 준다."""
+        from datetime import date
+        date.fromisoformat(start), date.fromisoformat(end)
+        rows = self._api("GET", f"{SCHEDULE_API}/schedules?start_date={start}&end_date={end}", SCHEDULE_ORIGIN).get("data", [])
+        return [{"id": x.get("id"), "calendar_id": x.get("project_id"), "title": x.get("title"),
+                 "start": utc_to_local(x.get("start_date")), "end": utc_to_local(x.get("end_date")),
+                 "all_day": x.get("is_all_day"), "location": x.get("location") or None,
+                 "repeat": x.get("is_repeat")} for x in rows]
+
+    def _default_calendar(self) -> int:
+        cals = [c for c in self.calendars() if c["type"] == "PERSONAL" and c["writable"]]
+        if not cals:
+            raise HiworksError("일정을 넣을 개인 캘린더를 찾지 못했습니다.")
+        return cals[0]["id"]
+
+    def add_schedule(self, title: str, start: str, end: str, all_day: bool = False, location: str = "",
+                     memo: str = "", calendar_id: int | None = None) -> dict:
+        """일정 등록. start·end 는 'YYYY-MM-DD HH:MM'(종일이면 'YYYY-MM-DD'), 이 컴퓨터 시간대 기준. 알림·참석자는 넣지 않는다."""
+        if not title.strip():
+            raise HiworksError("일정 제목이 비었습니다.")
+        s_utc, e_utc = local_to_utc(start, all_day, is_end=False), local_to_utc(end, all_day, is_end=True)
+        if e_utc < s_utc:
+            raise HiworksError("끝 시각이 시작 시각보다 앞입니다.")
+        pid = calendar_id or self._default_calendar()
+        req = {"title": title, "content": memo, "location": location, "is_important": False, "is_all_day": all_day,
+               "start_date": s_utc, "end_date": e_utc, "alarm_list": []}
+        d = self._raw("POST", f"{SCHEDULE_API}/projects/{pid}/schedules", SCHEDULE_ORIGIN,
+                      multipart=[("request", "blob", "application/json", json.dumps(req, ensure_ascii=False).encode())])
+        x = d.get("data") or {}
+        return {"created": True, "id": x.get("id"), "calendar_id": pid, "title": x.get("title"),
+                "start": utc_to_local(x.get("start_date")), "end": utc_to_local(x.get("end_date"))}
+
+    def delete_schedule(self, schedule_id: int, on_date: str, calendar_id: int | None = None) -> dict:
+        """일정 삭제(반복 일정이면 그날 것만). on_date 는 그 일정의 날짜 YYYY-MM-DD."""
+        pid = calendar_id or self._default_calendar()
+        self._raw("DELETE", f"{SCHEDULE_API}/projects/{pid}/schedules/{int(schedule_id)}"
+                            f"?target_date={on_date}&delete_type=NONE", SCHEDULE_ORIGIN)
+        return {"deleted": int(schedule_id), "date": on_date}
+
+    # ---------- 아침 요약 ----------
+
+    def today(self, mail_limit: int = 10) -> dict:
+        """오늘 한눈에 — 안 읽은 메일·결재할 문서 수·오늘 일정·근무 체크·같은 부서에서 오늘 쉬는 사람.
+        한 항목이 실패해도 나머지는 채우고 그 항목에 error 를 남긴다."""
+        from datetime import date
+        today = date.today()
+        out: dict = {"date": today.isoformat()}
+
+        def part(key, fn):
+            try:
+                out[key] = fn()
+            except HiworksError as e:
+                out[key] = {"error": str(e)}
+
+        def unread():
+            r = self.list_mails("b0", limit=50)
+            items = [m for m in r["items"] if m.get("unread")]
+            return {"count_in_latest_50": len(items),
+                    "items": [{k: m[k] for k in ("no", "from", "subject", "received")} for m in items[:mail_limit]]}
+
+        def leave():
+            me = self.me()
+            mine = set(self._directory()["belongs"].get(me["office_user_no"], []))
+            names = {self._directory()["nodes"][n]["node_name"] for n in mine if n in self._directory()["nodes"]}
+            rows = self.vacation_calendar(today.year, today.month)
+            return [{k: p[k] for k in ("name", "departments", "type", "start", "end", "full_day", "start_time", "end_time")}
+                    for p in rows if p["start"] <= today.isoformat() <= p["end"] and names & set(p["departments"])
+                    and p["office_user_no"] != me["office_user_no"]]
+
+        part("unread_mail", unread)
+        part("approval", self.approval_counts)
+        part("schedules", lambda: self.schedules(today.isoformat(), today.isoformat()))
+        part("work", self.work_status)
+        part("team_on_leave", leave)
+        return out
+
     # ---------- 근무 체크(출근·퇴근) ----------
 
     def work_status(self) -> dict:
@@ -897,6 +1095,26 @@ def html_escape_lines(text: str) -> str:
     return "<br>".join(_html.escape(line) for line in (text or "").strip().splitlines())
 
 
+def local_to_utc(value: str, all_day: bool, is_end: bool) -> str:
+    """'YYYY-MM-DD HH:MM' 또는 'YYYY-MM-DD'(종일) → 서버 형식 UTC 'YYYY-MM-DDTHH:MM:SSZ'."""
+    from datetime import datetime, timezone
+    v = value.strip()
+    if all_day or len(v) == 10:
+        v = f"{v[:10]} {'23:59' if is_end else '00:00'}"
+    try:
+        local = datetime.strptime(v, "%Y-%m-%d %H:%M").astimezone()
+    except ValueError:
+        raise HiworksError(f"시각 형식이 아닙니다: {value} (예: 2026-10-02 14:00)") from None
+    return local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def utc_to_local(value: str | None) -> str | None:
+    from datetime import datetime
+    if not value:
+        return None
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
 def summarize_document(x: dict, domain: str) -> dict:
     code = x.get("list_status")
     status = APPROVAL_STATUS.get(code, code) if code else ("완료" if x.get("complete_date") else "진행")
@@ -905,6 +1123,22 @@ def summarize_document(x: dict, domain: str) -> dict:
             "drafted": x.get("regist_date"), "completed": x.get("complete_date"), "status": status, "status_code": code,
             "my_role": x.get("approval_types") or [], "attachments": x.get("attached_file_flag") == "Y",
             "url": f"{APPROVAL_ORIGIN}/{domain}/approval/document/view/{x.get('id')}" if x.get("id") else None}
+
+
+def summarize_attachment(a: dict) -> dict:
+    """첨부 메타 — 서버 키 이름이 버전마다 달라 흔한 이름을 차례로 본다."""
+    pick = lambda *ks: next((a.get(k) for k in ks if a.get(k) not in (None, "")), None)
+    return {"part_id": pick("part_id", "partId", "id", "no"), "name": pick("name", "file_name", "filename", "original_name"),
+            "size": pick("size", "file_size"), "content_type": pick("content_type", "mime_type", "type")}
+
+
+def quote_original(m: dict) -> str:
+    """답장·전달 본문 아래에 붙일 원문 인용."""
+    import html as _html
+    head = "<br>".join(_html.escape(x) for x in (
+        "-----Original Message-----", f"From: {m.get('from') or ''}", f"To: {', '.join(m.get('to') or [])}",
+        f"Sent: {m.get('received') or ''}", f"Subject: {m.get('subject') or ''}"))
+    return f"<br><br><div>{head}</div><blockquote>{m.get('content_html') or ''}</blockquote>"
 
 
 def summarize_mail(m: dict) -> dict:
@@ -1030,6 +1264,18 @@ def run_api_command(hw: "Hiworks", a) -> int:
         else:
             emit(hw.approval_counts() if a.action == "count"
                  else hw.approval_documents(a.box, a.status, a.search, a.limit, a.offset))
+    elif a.cmd == "vacation-cancel":
+        payload, days = hw.vacation_cancel_payload(a.start, a.end, a.reason, a.dept, use_saved_line=not a.no_saved_line)
+        d = hw._directory()
+        preview = {"cancel": [{k: x[k] for k in ("date", "type", "time_type", "days", "hours")} for x in days],
+                   "department": d["nodes"].get(payload["node_id"], {}).get("node_name"),
+                   "approval_line": [{"role": APPROVAL_ROLE.get(u["approval_type"], u["approval_type"]),
+                                      "name": (d["people"].get(u["office_user_no"]) or {}).get("name")} for u in payload["line_users"]],
+                   "reason": payload["comment"]}
+        if not a.yes:
+            emit({"preview": preview, "note": "취소하지 않았습니다. 실제로 취소를 신청하려면 --yes (결재선에 알림이 갑니다)"})
+            return 0
+        emit({**hw.cancel_vacation(payload), "preview": preview})
     elif a.cmd == "vacation-history":
         from datetime import date
         emit(hw.my_vacation_history(a.year or date.today().year, with_lines=a.lines))
@@ -1052,6 +1298,34 @@ def run_api_command(hw: "Hiworks", a) -> int:
         d = hw._directory()
         by_id = {e.get("user_id"): e.get("name") for e in d["people"].values()}
         emit({role: [{"user_id": u, "name": by_id.get(u)} for u in ids] for role, ids in line.items()})
+    elif a.cmd == "today":
+        emit(hw.today(a.mail_limit))
+    elif a.cmd == "calendar":
+        from datetime import date, datetime, timedelta
+        if a.action == "calendars":
+            emit(hw.calendars())
+        elif a.action == "list":
+            start = a.date_from or date.today().isoformat()
+            end = a.date_to or (date.fromisoformat(start) + timedelta(days=6)).isoformat()
+            emit({"from": start, "to": end, "schedules": hw.schedules(start, end)})
+        elif a.action == "add":
+            if not (a.title and a.start):
+                raise HiworksError("add 에는 --title 과 --start 가 필요합니다.")
+            end = a.end or (a.start if a.all_day or len(a.start.strip()) == 10 else
+                            (datetime.strptime(a.start.strip(), "%Y-%m-%d %H:%M") + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M"))
+            if not a.yes:
+                emit({"preview": {"title": a.title, "start": a.start, "end": end, "all_day": a.all_day,
+                                  "location": a.location, "calendar": a.calendar or "내 개인 캘린더"},
+                      "note": "등록하지 않았습니다. 실제로 등록하려면 --yes"})
+                return 0
+            emit(hw.add_schedule(a.title, a.start, end, a.all_day, a.location, a.memo, a.calendar))
+        else:
+            if not (a.id and a.date):
+                raise HiworksError("delete 에는 일정 id 와 --date YYYY-MM-DD 가 필요합니다.")
+            if not a.yes:
+                emit({"preview": {"delete": a.id, "date": a.date}, "note": "삭제하지 않았습니다. 실제로 지우려면 --yes"})
+                return 0
+            emit(hw.delete_schedule(a.id, a.date, a.calendar))
     elif a.cmd == "work":
         if a.action == "status":
             emit(hw.work_status())
@@ -1083,14 +1357,32 @@ def run_api_command(hw: "Hiworks", a) -> int:
         if not a.html:
             m.pop("content_html", None)
         emit(m)
+    elif a.mail_cmd == "attachment":
+        atts = hw.get_mail(a.no)["attachments"]
+        targets = atts if a.part == "all" else [x for x in atts if str(x["part_id"]) == a.part]
+        if not targets:
+            raise HiworksError(f"메일 {a.no} 에 받을 첨부가 없습니다(첨부: {[x['part_id'] for x in atts]}).")
+        emit({"saved": [str(hw.download_attachment(a.no, x["part_id"], Path(a.dest).expanduser())) for x in targets]})
     elif a.mail_cmd == "send":
         body = Path(a.body_file).read_text(encoding="utf-8") if a.body_file else a.body
-        preview = {"to": as_list(a.to), "cc": as_list(a.cc), "bcc": as_list(a.bcc), "subject": a.subject,
-                   "html": a.html, "body_preview": body[:300]}
+        if a.reply_to and a.forward:
+            raise HiworksError("--reply-to 와 --forward 는 함께 쓸 수 없습니다.")
+        orig = hw.get_mail(a.reply_to or a.forward) if (a.reply_to or a.forward) else None
+        to = a.to or (orig["from"] if a.reply_to and orig else None)
+        if not to:
+            raise HiworksError("받는 사람(--to)이 필요합니다.")
+        subject = a.subject or ((("RE: " if a.reply_to else "FW: ") + (orig.get("subject") or "")) if orig else None)
+        if not subject:
+            raise HiworksError("제목(--subject)이 필요합니다.")
+        preview = {"to": as_list(to), "cc": as_list(a.cc), "bcc": as_list(a.bcc), "subject": subject,
+                   "html": a.html, "body_preview": body[:300], "attachments": a.attach,
+                   "reply_to": a.reply_to, "forward_of": a.forward,
+                   "forwarded_attachments": len(orig["attachments"]) if a.forward and orig else 0}
         if not a.yes:
             emit({"preview": preview, "note": "보내지 않았습니다. 실제로 보내려면 --yes"})
             return 0
-        emit(hw.send_mail(a.to, a.subject, body, a.cc, a.bcc, html=a.html))
+        emit(hw.send_mail(to, subject, body, a.cc, a.bcc, html=a.html, attachments=a.attach,
+                          reply_to=a.reply_to, forward_of=a.forward))
     elif a.mail_cmd == "delete":
         if not a.yes:
             emit({"preview": {"no_list": a.no, "permanent": a.permanent},
@@ -1187,19 +1479,26 @@ def main() -> int:
     ml.add_argument("--offset", type=int, default=0)
     ml.add_argument("--subject", help="제목에 들어간 말")
     ml.add_argument("--from", dest="sender", help="보낸 사람 주소")
-    mr = m.add_parser("read", help="메일 본문(안 읽은 메일은 읽음으로 바뀐다)")
+    mr = m.add_parser("read", help="메일 본문(읽음 표시는 바뀌지 않는다)")
     mr.add_argument("no", type=int)
     mr.add_argument("--html", action="store_true", help="HTML 본문도 함께")
     ms = m.add_parser("send", help="메일 발송 — --yes 없으면 미리보기만")
-    ms.add_argument("--to", required=True, help="받는 사람(쉼표로 여러 명)")
+    ms.add_argument("--to", help="받는 사람(쉼표로 여러 명). 답장이면 생략 시 원래 보낸 사람")
     ms.add_argument("--cc", default="")
     ms.add_argument("--bcc", default="")
-    ms.add_argument("--subject", required=True)
+    ms.add_argument("--subject", help="제목(답장·전달이면 생략 시 RE:/FW: + 원래 제목)")
+    ms.add_argument("--attach", action="append", default=[], help="첨부할 파일 경로(여러 번 가능)")
+    ms.add_argument("--reply-to", type=int, help="이 번호의 메일에 답장(원문 인용)")
+    ms.add_argument("--forward", type=int, help="이 번호의 메일을 전달(원문·원본 첨부 포함)")
     g2 = ms.add_mutually_exclusive_group(required=True)
     g2.add_argument("--body", help="본문(텍스트)")
     g2.add_argument("--body-file", help="본문 파일(텍스트, --html 이면 HTML)")
     ms.add_argument("--html", action="store_true", help="본문을 HTML 로 보낸다")
     ms.add_argument("--yes", action="store_true", help="실제로 보낸다")
+    mat = m.add_parser("attachment", help="메일 첨부파일 받기")
+    mat.add_argument("no", type=int)
+    mat.add_argument("part", help="첨부 part_id 또는 all")
+    mat.add_argument("--dest", default=str(Path.home() / "Downloads"), help="저장 폴더(기본 ~/Downloads)")
     md = m.add_parser("delete", help="메일 삭제(기본 휴지통 이동) — --yes 없으면 미리보기만")
     md.add_argument("no", type=int, nargs="+")
     md.add_argument("--permanent", action="store_true", help="완전 삭제(복구 불가)")
@@ -1220,6 +1519,13 @@ def main() -> int:
     vl.add_argument("--approver", action="append", default=[], help="결재자(B) — 적은 순서가 결재 순서")
     vl.add_argument("--processor", action="append", default=[], help="처리자(C)")
     vl.add_argument("--ref", action="append", default=[], help="참조자(F)")
+    vc = sub.add_parser("vacation-cancel", help="휴가 취소 신청 — --yes 없으면 미리보기만")
+    vc.add_argument("--start", required=True, help="YYYY-MM-DD")
+    vc.add_argument("--end", help="YYYY-MM-DD(기본 시작일)")
+    vc.add_argument("--reason", default="", help="사유")
+    vc.add_argument("--dept", help="신청 부서(기본 내 소속 중 가장 아래 부서)")
+    vc.add_argument("--no-saved-line", action="store_true", help="저장해 둔 결재선을 넣지 않는다")
+    vc.add_argument("--yes", action="store_true", help="실제로 취소를 신청한다(결재선에 알림이 간다)")
     vh = sub.add_parser("vacation-history", help="내 휴가 신청 내역(JSON) — --lines 면 결재선도")
     vh.add_argument("--year", type=int, help="연도(기본 올해)")
     vh.add_argument("--lines", action="store_true", help="결재 문서의 결재선도 붙인다")
@@ -1231,6 +1537,22 @@ def main() -> int:
     ap2.add_argument("--search", help="제목·내용 등 검색어")
     ap2.add_argument("--limit", type=int, default=30)
     ap2.add_argument("--offset", type=int, default=0)
+    td = sub.add_parser("today", help="아침 요약 — 안 읽은 메일·결재할 문서·오늘 일정·근무 체크·오늘 쉬는 팀원(JSON)")
+    td.add_argument("--mail-limit", type=int, default=10, help="보여 줄 안 읽은 메일 수")
+    cl = sub.add_parser("calendar", help="일정 — list 조회 · add 등록 · delete 삭제 · calendars 캘린더 목록")
+    cl.add_argument("action", choices=["list", "add", "delete", "calendars"])
+    cl.add_argument("id", nargs="?", type=int, help="delete 때 일정 id")
+    cl.add_argument("--from", dest="date_from", help="list 시작 YYYY-MM-DD(기본 오늘)")
+    cl.add_argument("--to", dest="date_to", help="list 끝 YYYY-MM-DD(기본 시작일+6일)")
+    cl.add_argument("--title")
+    cl.add_argument("--start", help="add 시작 'YYYY-MM-DD HH:MM' (종일이면 YYYY-MM-DD)")
+    cl.add_argument("--end", help="add 끝 'YYYY-MM-DD HH:MM' (기본 시작+1시간)")
+    cl.add_argument("--all-day", action="store_true")
+    cl.add_argument("--location", default="")
+    cl.add_argument("--memo", default="")
+    cl.add_argument("--calendar", type=int, help="캘린더 id(기본 내 개인 캘린더)")
+    cl.add_argument("--date", help="delete 때 그 일정의 날짜 YYYY-MM-DD")
+    cl.add_argument("--yes", action="store_true", help="add·delete 를 실제로 한다")
     wk = sub.add_parser("work", help="근무 체크 — status 상태 · in 출근 · out 퇴근(in·out 은 --yes 없으면 미리보기만)")
     wk.add_argument("action", choices=["status", "in", "out"])
     wk.add_argument("--yes", action="store_true", help="실제로 기록한다(지금 시각)")
@@ -1271,7 +1593,7 @@ def main() -> int:
                 return 0
             how = hw.ensure(otp)
             if a.cmd in ("mail", "vacation", "leave-calendar", "org", "person", "vacation-request", "work",
-                         "approval", "vacation-line", "vacation-history"):
+                         "approval", "vacation-line", "vacation-history", "calendar", "vacation-cancel", "today"):
                 return run_api_command(hw, a)
             if a.cmd == "session":
                 print(f"{'저장 세션 재사용' if how == 'reused' else '새로 로그인'} · {hw.username}")

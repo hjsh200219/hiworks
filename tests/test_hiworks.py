@@ -652,5 +652,122 @@ class ApprovalLineLookupTests(ApiBase):
         self.assertIn("존재하지 않은 문서", h[0]["approval_line_error"])
 
 
+
+class MailExtraTests(ApiBase):
+    def mail_routes(self):
+        return {
+            "POST /mails/cert-key": FakeResponse(200, {"data": "CK"}),
+            "GET /senders": FakeResponse(200, {"data": [{"no": 7, "address": "a@x.com", "is_default": True}]}),
+            "POST /mails/send": FakeResponse(200, {"data": {"send_type": "NORMAL"}}),
+            "GET /mails/5": FakeResponse(200, {"data": {"no": 5, "from": "B <b@x.com>", "to_address": ["a@x.com"],
+                                                       "subject": "원래 제목", "message": {"content": "<p>원문</p>",
+                                                       "attachments": [{"part_id": "1.2", "name": "f.txt", "size": 3}]}}}),
+        }
+
+    def sent_body(self, srv):
+        return [c for c in srv.calls if c[1].endswith("/mails/send")][0][2]
+
+    def test_reply_sets_flags_subject_and_quotes_original(self):
+        srv = self.serve(self.mail_routes())
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            hw.send_mail("b@x.com", None, "답장", reply_to=5)
+        b = self.sent_body(srv)
+        self.assertEqual((b["is_reply"], b["is_forward"], b["original_mail_no"], b["response_target_mail_no"]), (True, False, 5, 5))
+        self.assertEqual(b["subject"], "RE: 원래 제목")
+        self.assertIn("<p>원문</p>", b["content"])
+        self.assertEqual(b["original_temp_part_id_list"], [])
+
+    def test_forward_carries_original_attachments(self):
+        srv = self.serve(self.mail_routes())
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            out = hw.send_mail("c@x.com", None, "전달", forward_of=5)
+        b = self.sent_body(srv)
+        self.assertEqual((b["is_forward"], b["subject"], b["original_temp_part_id_list"]), (True, "FW: 원래 제목", ["1.2"]))
+        self.assertEqual(out["forwarded_attachments"], 1)
+
+    def test_missing_attachment_file_refused_before_any_call(self):
+        srv = self.serve(self.mail_routes())
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            with self.assertRaises(hiworks.HiworksError):
+                hw.send_mail("b@x.com", "s", "b", attachments=["/no/such/file.txt"])
+        self.assertEqual(srv.calls, [])
+
+    def test_reply_and_forward_together_refused(self):
+        self.serve(self.mail_routes())
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            with self.assertRaises(hiworks.HiworksError):
+                hw.send_mail("b@x.com", "s", "b", reply_to=5, forward_of=5)
+
+    def test_attachment_meta_key_variants(self):
+        self.assertEqual(hiworks.summarize_attachment({"partId": "2", "file_name": "a.pdf", "file_size": 9})["name"], "a.pdf")
+
+
+class CalendarTimeTests(unittest.TestCase):
+    def test_local_to_utc_uses_machine_timezone(self):
+        with patch.dict(os.environ, {"TZ": "Asia/Seoul"}):
+            import time as _t; _t.tzset()
+            self.assertEqual(hiworks.local_to_utc("2026-10-02 23:00", False, False), "2026-10-02T14:00:00Z")
+            self.assertEqual(hiworks.local_to_utc("2026-10-02", True, True), "2026-10-02T14:59:00Z")
+            self.assertEqual(hiworks.utc_to_local("2026-10-02T14:30:00Z"), "2026-10-02 23:30")
+        import time as _t; _t.tzset()
+
+    def test_bad_time_format(self):
+        with self.assertRaises(hiworks.HiworksError):
+            hiworks.local_to_utc("10/2 3pm", False, False)
+
+
+class VacationCancelTests(ApiBase):
+    def routes(self, days):
+        r = VacationRequestTests.routes(self, VacationRequestTests.CHECK_OK)
+        r["GET /vacation-request-calendar"] = FakeResponse(200, {"data": {"calendar_data": [
+            {"date": d, "vacation_request_details": [{"request_detail_id": 900 + i, "vacation_type_title": "연차", "time_type": "D", "days": 1}]}
+            for i, d in enumerate(days)] + [{"date": "2026-12-26", "vacation_request_details": []}]}})
+        r["POST /vacation-cancel"] = FakeResponse(200, {"data": {}})
+        return r
+
+    def test_payload_lists_detail_numbers_and_form_line(self):
+        self.serve(self.routes(["2026-12-21", "2026-12-22"]))
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            p, days = hw.vacation_cancel_payload("2026-12-21", "2026-12-22", reason="사정")
+        self.assertEqual(p["vacation_request_detail_nos"], [900, 901])
+        self.assertEqual((p["form_id"], p["node_id"], p["year"], p["comment"]), (9, 2, "2026", "사정"))
+        self.assertNotIn("period_selections", p)
+        self.assertEqual([d["date"] for d in days], ["2026-12-21", "2026-12-22"])
+
+    def test_no_leave_in_range_is_refused(self):
+        self.serve(self.routes([]))
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            with self.assertRaises(hiworks.HiworksError):
+                hw.vacation_cancel_payload("2026-12-21")
+
+    def test_cancel_posts_wrapped_payload_once(self):
+        srv = self.serve(self.routes(["2026-12-21"]))
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            p, _ = hw.vacation_cancel_payload("2026-12-21")
+            hw.cancel_vacation(p)
+        sent = [c for c in srv.calls if c[1].endswith("/vacation-cancel")]
+        self.assertEqual((len(sent), sent[0][2]), (1, {"data": p}))
+
+
+class TodayTests(ApiBase):
+    def test_one_failing_part_does_not_break_others(self):
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            with patch.object(hw, "list_mails", return_value={"items": [
+                    {"no": 1, "from": "x", "subject": "s", "received": "t", "unread": True},
+                    {"no": 2, "from": "y", "subject": "t", "received": "t", "unread": False}]}), \
+                 patch.object(hw, "approval_counts", side_effect=hiworks.HiworksApiError(500, "ERR")), \
+                 patch.object(hw, "schedules", return_value=[]), \
+                 patch.object(hw, "work_status", return_value={"status": "출근전"}), \
+                 patch.object(hw, "me", return_value={"office_user_no": 1}), \
+                 patch.object(hw, "_directory", return_value={"belongs": {1: [2]}, "nodes": {2: {"node_name": "개발팀"}}}), \
+                 patch.object(hw, "vacation_calendar", return_value=[
+                     {"name": "동료", "office_user_no": 3, "departments": ["개발팀"], "type": "연차", "start": "2000-01-01",
+                      "end": "2999-12-31", "full_day": True, "start_time": None, "end_time": None}]):
+                out = hw.today()
+        self.assertEqual(out["unread_mail"]["count_in_latest_50"], 1)
+        self.assertIn("error", out["approval"])
+        self.assertEqual([x["name"] for x in out["team_on_leave"]], ["동료"])
+
+
 if __name__ == "__main__":
     unittest.main()
