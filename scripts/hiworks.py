@@ -21,6 +21,11 @@
                                          전사 휴가 캘린더 — 누가 언제 휴가인지(연속된 날은 기간으로 묶음)
   org                                    조직도 — 부서 트리와 구성원
   person <이름|아이디>                   직원 찾기 — 본인이 공개한 항목만
+  work status|in|out [--yes]              근무 체크 — 상태, 출근·퇴근 기록(지금 시각, --yes 때만)
+  approval list [--box all|writer|approval|refer|read|reading|return|temp] [--status 진행|완료|반려] [--search 말]
+  approval count                         전자결재 — 내 문서 목록·상태, 결재할 문서 수
+  vacation-line show|set|add|remove|clear [--approver 이름] [--processor 이름] [--ref 이름]
+                                         휴가 결재선 저장 — 휴가 신청 때 자동으로 들어간다(config.json, 아이디로 저장)
   vacation-request --start D [--end D] [--half am|pm] [--reason …] [--yes]
                                          휴가 신청 — 서버 사전 검사 + 미리보기, --yes 때만 실제 신청
   forget                                 키체인 항목·설정·세션 파일 삭제
@@ -66,6 +71,13 @@
   /v1/employees?page[limit]=… · /v1/positions · /v1/jobs. 직원 휴대폰·이메일·입사일은 본인 공개 플래그(…_visible)가 Y 일 때만 내보낸다
 - 전사 휴가 캘린더: GET hr-work-api.office.hiworks.com/v4/vacation-calendar?filter[year]&filter[month][&filter[node]][&filter[search]]
   → 날짜별 행(office_user_no·vacation_type_title·type days|hours·approval_status)
+- 근무 체크(hr-timecheck-api /v4): GET web/user-work-info → date·work_status·start_at/end_at("0000-…"=없음)·
+  enable_start/enable_end(Y 면 지금 누를 수 있음) · POST web/time-record {"data":{"type":"1"}}=출근 · "2"=퇴근(하루 한 번)
+- 전자결재(approval-api.office.hiworks.com/v5, Origin approval.office.hiworks.com):
+  GET my-documents?[filter[box_status][in]=WRITER|APPROVAL|REFER|CIRCULATION,CC|AUTH_READ|RETURN]&page[offset]&page[limit]
+  (필터 없으면 전부) · GET my-documents/count · GET temp-documents. 상태: list_status(PROGRESS 등)가 있으면 그것,
+  없으면 complete_date 가 있으면 완료. 결재할 문서 수: POST approval.office.hiworks.com/{domain}/approval/document_ajax/
+  pMenu=get_approval_count(폼 전송) → result.w 대기·e 예정·p 진행·v 확인·a 전체
 - 휴가 신청(hr-work-api /v4, 쓰기 본문은 {"data": …}):
   GET forms/vacation-request/node/{node_id} → 양식 id·보존 기간·보안 등급·기본 결재선 line_users(approval_type B 신청·C 처리·F 참조)
   POST vacation-request-check → available_user_nos·…_exceptions·date_exceptions[].…_users (신청서를 만들지 않는 사전 검사.
@@ -101,6 +113,14 @@ CACHE_API = "https://cache-api.office.hiworks.com"
 WORK_API = "https://work-api.office.hiworks.com"
 HR_API = "https://hr-api.office.hiworks.com"
 HR_WORK_API = "https://hr-work-api.office.hiworks.com/v4"
+TIMECHECK_API = "https://hr-timecheck-api.office.hiworks.com/v4"
+APPROVAL_API = "https://approval-api.office.hiworks.com/v5"
+APPROVAL_ORIGIN = "https://approval.office.hiworks.com"
+# 내 문서함 이름 → box_status 필터(웹 화면 approval.js boxStatusFilterNaming 과 같다). all 은 필터 없이 전부.
+APPROVAL_BOXES = {"writer": "WRITER", "approval": "APPROVAL", "refer": "REFER", "read": "CIRCULATION,CC",
+                  "reading": "AUTH_READ", "return": "RETURN"}
+APPROVAL_STATUS = {"PROGRESS": "진행", "COMPLETE": "완료", "COMPLETED": "완료", "RETURN": "반려", "RETURNED": "반려",
+                   "WAIT": "대기", "WAITING": "대기", "CANCEL": "취소", "HOLD": "보류"}
 STEP_TITLES = {
     "REQUIRE_OTP_VALIDATION": "2단계 인증 코드 입력이 필요합니다",
     "REQUIRE_OTP_SETTING": "2단계 인증 설정이 필요합니다(브라우저에서 하이웍스에 로그인해 설정하세요)",
@@ -180,6 +200,21 @@ def keyring_backend():
         raise HiworksError(f"이 컴퓨터에서 쓸 수 있는 키체인이 없습니다({name}). "
                            "환경변수 HIWORKS_USERNAME/HIWORKS_PASSWORD 로 대신 지정하세요.")
     return kr
+
+
+def saved_vacation_line() -> dict:
+    """저장해 둔 휴가 결재선 {"approvers": [...], "processors": [...], "refs": [...]} — 값은 직원 아이디(user_id)."""
+    line = read_json(config_file()).get("vacation_line") or {}
+    return {k: list(line.get(k) or []) for k in ("approvers", "processors", "refs")}
+
+
+def save_vacation_line(line: dict) -> None:
+    cfg = read_json(config_file())
+    if any(line.get(k) for k in ("approvers", "processors", "refs")):
+        cfg["vacation_line"] = {k: list(line.get(k) or []) for k in ("approvers", "processors", "refs")}
+    else:
+        cfg.pop("vacation_line", None)
+    write_private(config_file(), cfg)
 
 
 def configured_email() -> tuple[str | None, str]:
@@ -590,9 +625,17 @@ class Hiworks:
 
     def vacation_request_payload(self, start: str, end: str | None = None, vtype: str = "연차", half: str | None = None,
                                  start_time: str | None = None, end_time: str | None = None, reason: str = "",
-                                 department: str | None = None) -> dict:
+                                 department: str | None = None, approvers=(), processors=(), refs=(),
+                                 use_saved_line: bool = True) -> dict:
         """휴가 신청 본문을 만든다(보내지 않음). 종일은 기간(start~end, 주말·공휴일은 서버가 뺀다),
-        반차는 하루만 — half="am"(09~13시)·"pm"(14~18시) 또는 start_time·end_time 직접 지정."""
+        반차는 하루만 — half="am"(09~13시)·"pm"(14~18시) 또는 start_time·end_time 직접 지정.
+        결재선은 양식 기본선에 이름으로 추가한다 — approvers 신청 라인 결재자(B, 적은 순서대로)·processors 처리(C)·refs 참조(F).
+        use_saved_line 이면 저장해 둔 결재선(vacation-line)을 먼저 넣고 그 뒤에 이번 추가분을 붙인다."""
+        if use_saved_line:
+            saved = saved_vacation_line()
+            approvers = saved["approvers"] + as_list(approvers)
+            processors = saved["processors"] + as_list(processors)
+            refs = saved["refs"] + as_list(refs)
         from datetime import date, datetime
         me, d = self.me(), self._directory()
         types = {t["title"]: t for t in self.vacation_types()}
@@ -614,8 +657,7 @@ class Hiworks:
         payload = {
             "form_id": form.get("id"), "node_id": node_id, "preserved_term": form.get("preserved_term"),
             "security_level": form.get("security_level"), "comment": html_escape_lines(reason)[:1000],
-            "line_users": [{"office_user_no": u["office_user_no"], "node_id": u["node_id"], "approval_type": u["approval_type"]}
-                           for u in form.get("line_users", []) if u.get("office_user_no")],
+            "line_users": self._approval_line(form, me["office_user_no"], d, approvers, processors, refs),
             "user_nos": [me["office_user_no"]],
         }
         type_no = types[vtype]["id"]
@@ -634,6 +676,50 @@ class Hiworks:
             payload["period_selections"] = [{"vacation_type_no": type_no, "start_date": s_date.isoformat(),
                                              "end_date": e_date.isoformat()}]
         return payload
+
+    def _approval_line(self, form: dict, me_no: int, d: dict, approvers, processors, refs) -> list[dict]:
+        """양식 기본 결재선 + 추가 인원. 화면과 같이 B → C → F 순으로 싣고, 같은 역할에 같은 사람은 한 번만."""
+        allowed = set(form.get("approval_method") or "BCF")
+        lines = {t: [{"office_user_no": u["office_user_no"], "node_id": u["node_id"], "approval_type": t}
+                     for u in form.get("line_users", []) if u.get("office_user_no") and u.get("approval_type") == t]
+                 for t in "BCF"}
+        for t, names in (("B", approvers), ("C", processors), ("F", refs)):
+            names = as_list(names)
+            if names and t not in allowed:
+                raise HiworksError(f"이 양식은 {APPROVAL_ROLE[t]} 결재선을 쓰지 않습니다(결재 방식 {form.get('approval_method')}).")
+            for name in names:
+                no = self._resolve_person(name, d)
+                if t == "B" and no == me_no:
+                    raise HiworksError("본인은 결재자로 추가할 수 없습니다.")
+                if any(x["office_user_no"] == no for x in lines[t]):
+                    continue
+                nodes = d["belongs"].get(no) or []
+                node = max(nodes, key=lambda n: d["nodes"].get(n, {}).get("depth", 0)) if nodes else None
+                lines[t].append({"office_user_no": no, "node_id": node, "approval_type": t})
+        return lines["B"] + lines["C"] + lines["F"]
+
+    def resolve_user_ids(self, names) -> list[dict]:
+        """이름·아이디 목록 → [{"user_id", "name"}] (저장용 — 이름이 같은 사람이 생겨도 흔들리지 않게 아이디로 둔다)."""
+        d = self._directory()
+        out = []
+        for n in as_list(names):
+            no = self._resolve_person(n, d)
+            e = d["people"][no]
+            out.append({"user_id": e.get("user_id"), "name": e.get("name")})
+        return out
+
+    def _resolve_person(self, name: str, d: dict) -> int:
+        """이름(또는 아이디)을 재직 중인 직원 한 명으로 정한다. 같은 이름이 여럿이면 후보를 보여 주고 멈춘다."""
+        q = name.strip()
+        active = {no: e for no, e in d["people"].items() if e.get("active") == "Y" and e.get("del_flag") != "Y"}
+        hits = [no for no, e in active.items() if q in (e.get("name"), e.get("user_id"))]
+        if len(hits) == 1:
+            return hits[0]
+        if not hits:
+            raise HiworksError(f"'{name}' 와 이름이 같은 재직자가 없습니다.")
+        cands = ", ".join(f"{active[n]['name']}({active[n].get('user_id')}, "
+                          f"{'/'.join(d['nodes'][x]['node_name'] for x in d['belongs'].get(n, []) if x in d['nodes'])})" for n in hits)
+        raise HiworksError(f"'{name}' 가 여러 명입니다 — 아이디로 지정하세요: {cands}")
 
     def check_vacation_request(self, payload: dict) -> dict:
         """서버 사전 검사(신청서는 만들지 않는다). ok=False 면 problems 에 사유."""
@@ -655,6 +741,66 @@ class Hiworks:
         self._hr_work("POST", "vacation-request", payload)
         return {"requested": True, "details": payload.get("details") or payload.get("period_selections")}
 
+    # ---------- 근무 체크(출근·퇴근) ----------
+
+    def work_status(self) -> dict:
+        """오늘 근무 체크 상태. 출근·퇴근 기록과 지금 누를 수 있는지."""
+        w = self._api("GET", f"{TIMECHECK_API}/web/user-work-info", HR_ORIGIN).get("data") or {}
+        t = lambda v: None if not v or v.startswith("0000") else v
+        return {"date": w.get("date"), "status": w.get("work_status"), "check_in": t(w.get("start_at")),
+                "check_out": t(w.get("end_at")), "can_check_in": w.get("enable_start") == "Y",
+                "can_check_out": w.get("enable_end") == "Y",
+                "records": [{"type": x.get("type"), "time": x.get("time"), "title": x.get("title")} for x in w.get("details") or []]}
+
+    def record_work(self, kind: str) -> dict:
+        """kind="in" 출근 · "out" 퇴근 — 지금 시각으로 기록된다. 퇴근은 하루에 한 번만. 재시도 없음."""
+        if kind not in ("in", "out"):
+            raise HiworksError("kind 는 in 또는 out 입니다.")
+        before = self.work_status()
+        if not before["can_check_in" if kind == "in" else "can_check_out"]:
+            raise HiworksError(f"지금은 {'출근' if kind == 'in' else '퇴근'} 체크를 할 수 없습니다(현재 상태: {before['status']}).")
+        self._api("POST", f"{TIMECHECK_API}/web/time-record", HR_ORIGIN, body={"data": {"type": "1" if kind == "in" else "2"}})
+        return {"recorded": "출근" if kind == "in" else "퇴근", "status": self.work_status()}
+
+    # ---------- 전자결재 ----------
+
+    def approval_documents(self, box: str = "all", status: str | None = None, search: str | None = None,
+                           limit: int = 30, offset: int = 0) -> dict:
+        """내 전자결재 문서 목록 + 상태. box: all(전부)·writer 기안·approval 결재·refer 수신·read 회람/참조·
+        reading 열람·return 반려·temp 임시저장. status 를 주면(진행·완료·반려 등) 그 상태만 남긴다."""
+        if box == "temp":
+            path = "/temp-documents"
+            q = []
+        else:
+            path = "/my-documents"
+            q = [] if box == "all" else [f"filter[box_status][in]={APPROVAL_BOXES[box]}"] if box in APPROVAL_BOXES else None
+            if q is None:
+                raise HiworksError(f"문서함 '{box}' 가 없습니다(가능: all, temp, {', '.join(APPROVAL_BOXES)}).")
+        if search:
+            from urllib.parse import quote
+            q.append(f"filter[search_all][like]={quote(search)}")
+        # 상태 필터는 서버에 없어 받아 와서 거른다 — 그래서 상태를 주면 한 번에 넉넉히(최대 200) 받는다.
+        fetch = max(limit, 200) if status else limit
+        q += [f"page[offset]={int(offset)}", f"page[limit]={int(fetch)}"]
+        d = self._api("GET", f"{APPROVAL_API}{path}?{'&'.join(q)}", APPROVAL_ORIGIN, accept="application/json;charset=UTF-8")
+        items = [summarize_document(x, self.office_domain) for x in d.get("data", [])]
+        if status:
+            items = [x for x in items if status in (x["status"], x["status_code"])]
+        return {"box": box, "count": len(items[:limit]), "items": items[:limit]}
+
+    def approval_counts(self) -> dict:
+        """결재할 문서 수(대기·예정·진행·확인·전체)와 내 문서함 총 건수."""
+        r = self._s.post(f"{APPROVAL_ORIGIN}/{self.office_domain}/approval/document_ajax/", retries=1,
+                         data={"pMenu": "get_approval_count"},
+                         headers={"Origin": APPROVAL_ORIGIN, "X-Requested-With": "XMLHttpRequest"})
+        try:
+            c = (json.loads(r.body) or {}).get("result") or {}
+        except ValueError:
+            c = {}
+        total = self._api("GET", f"{APPROVAL_API}/my-documents/count", APPROVAL_ORIGIN).get("data", {}).get("count")
+        names = {"w": "대기", "e": "예정", "p": "진행", "v": "확인", "a": "전체"}
+        return {"to_do": {names[k]: c.get(k) for k in names if k in c}, "my_documents_total": total}
+
     def _node_id(self, department: str, d: dict) -> int:
         if str(department).isdigit():
             return int(department)
@@ -672,9 +818,14 @@ def as_list(v) -> list:
     if v is None or v == "":
         return []
     if isinstance(v, (list, tuple)):
-        return [x for x in v if x not in (None, "")]
+        out = []
+        for x in v:
+            out.extend(as_list(x) if isinstance(x, str) else ([x] if x not in (None, "") else []))
+        return out
     return [x.strip() for x in str(v).split(",") if x.strip()]
 
+
+APPROVAL_ROLE = {"B": "결재(신청)", "C": "처리", "F": "참조"}
 
 VACATION_CHECK_REASONS = {
     "remain_days_exceptions": "잔여 일수가 부족합니다",
@@ -695,6 +846,16 @@ VACATION_CHECK_REASONS = {
 def html_escape_lines(text: str) -> str:
     import html as _html
     return "<br>".join(_html.escape(line) for line in (text or "").strip().splitlines())
+
+
+def summarize_document(x: dict, domain: str) -> dict:
+    code = x.get("list_status")
+    status = APPROVAL_STATUS.get(code, code) if code else ("완료" if x.get("complete_date") else "진행")
+    return {"id": x.get("id"), "code": x.get("document_code"), "title": x.get("title"), "form": x.get("form_title"),
+            "type": x.get("document_type"), "drafter": x.get("register_name"), "department": x.get("node_name"),
+            "drafted": x.get("regist_date"), "completed": x.get("complete_date"), "status": status, "status_code": code,
+            "my_role": x.get("approval_types") or [], "attachments": x.get("attached_file_flag") == "Y",
+            "url": f"{APPROVAL_ORIGIN}/{domain}/approval/document/view/{x.get('id')}" if x.get("id") else None}
 
 
 def summarize_mail(m: dict) -> dict:
@@ -788,7 +949,7 @@ def vacation_request_preview(hw: "Hiworks", payload: dict, vtype: str) -> dict:
     remaining = next((v for v in hw.my_vacation()["vacations"] if v["type"] == vtype), None)
     out = {"type": vtype, **span, "estimate": f"{est}{unit}",
            "department": d["nodes"].get(payload["node_id"], {}).get("node_name"),
-           "approval_line": [{"role": {"B": "신청", "C": "처리", "F": "참조"}.get(u["approval_type"], u["approval_type"]),
+           "approval_line": [{"role": APPROVAL_ROLE.get(u["approval_type"], u["approval_type"]),
                               "name": (d["people"].get(u["office_user_no"]) or {}).get("name")} for u in payload["line_users"]],
            "reason": payload["comment"], "check": hw.check_vacation_request(payload)}
     if remaining:
@@ -812,8 +973,45 @@ def run_api_command(hw: "Hiworks", a) -> int:
             raise HiworksError("--month 는 YYYY-MM 형식입니다.")
         y, mo = map(int, ym.split("-"))
         emit({"month": ym, "periods": hw.vacation_calendar(y, mo, name=a.name, department=a.dept)})
+    elif a.cmd == "approval":
+        emit(hw.approval_counts() if a.action == "count"
+             else hw.approval_documents(a.box, a.status, a.search, a.limit, a.offset))
+    elif a.cmd == "vacation-line":
+        line = saved_vacation_line()
+        new = {"approvers": hw.resolve_user_ids(a.approver), "processors": hw.resolve_user_ids(a.processor),
+               "refs": hw.resolve_user_ids(a.ref)}
+        if a.action == "set":
+            line = {k: [p["user_id"] for p in v] for k, v in new.items()}
+        elif a.action == "add":
+            for k, v in new.items():
+                line[k] += [p["user_id"] for p in v if p["user_id"] not in line[k]]
+        elif a.action == "remove":
+            gone = {p["user_id"] for p in hw.resolve_user_ids(a.names)}
+            line = {k: [u for u in v if u not in gone] for k, v in line.items()}
+        elif a.action == "clear":
+            line = {"approvers": [], "processors": [], "refs": []}
+        if a.action != "show":
+            save_vacation_line(line)
+        d = hw._directory()
+        by_id = {e.get("user_id"): e.get("name") for e in d["people"].values()}
+        emit({role: [{"user_id": u, "name": by_id.get(u)} for u in ids] for role, ids in line.items()})
+    elif a.cmd == "work":
+        if a.action == "status":
+            emit(hw.work_status())
+        elif not a.yes:
+            from datetime import datetime
+            st = hw.work_status()
+            can = st["can_check_in" if a.action == "in" else "can_check_out"]
+            emit({"preview": {"action": "출근" if a.action == "in" else "퇴근", "will_record_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                              "possible": can, "current": st},
+                  "note": "기록하지 않았습니다. 실제로 기록하려면 --yes" + (" (퇴근은 하루에 한 번만)" if a.action == "out" else "")})
+            return 0 if can else 1
+        else:
+            emit(hw.record_work(a.action))
     elif a.cmd == "vacation-request":
-        payload = hw.vacation_request_payload(a.start, a.end, a.type, a.half, a.start_time, a.end_time, a.reason, a.dept)
+        payload = hw.vacation_request_payload(a.start, a.end, a.type, a.half, a.start_time, a.end_time, a.reason, a.dept,
+                                              approvers=a.approver, processors=a.processor, refs=a.ref,
+                                              use_saved_line=not a.no_saved_line)
         preview = vacation_request_preview(hw, payload, a.type)
         if not a.yes:
             emit({"preview": preview, "note": "신청하지 않았습니다. 실제로 신청하려면 --yes (결재선에 알림이 갑니다)"})
@@ -958,6 +1156,23 @@ def main() -> int:
     sub.add_parser("org", help="조직도 — 부서 트리와 구성원(JSON)")
     pp = sub.add_parser("person", help="직원 찾기 — 이름·아이디·영문 이름 부분 일치(JSON)")
     pp.add_argument("query")
+    vl = sub.add_parser("vacation-line", help="휴가 결재선 저장 — 휴가 신청 때 자동으로 들어간다")
+    vl.add_argument("action", choices=["show", "set", "add", "remove", "clear"],
+                    help="show 보기 · set 통째로 바꾸기 · add 추가 · remove 빼기 · clear 지우기")
+    vl.add_argument("names", nargs="*", help="remove 때 뺄 이름·아이디")
+    vl.add_argument("--approver", action="append", default=[], help="결재자(B) — 적은 순서가 결재 순서")
+    vl.add_argument("--processor", action="append", default=[], help="처리자(C)")
+    vl.add_argument("--ref", action="append", default=[], help="참조자(F)")
+    ap2 = sub.add_parser("approval", help="전자결재 — list 문서 목록·상태 · count 건수")
+    ap2.add_argument("action", choices=["list", "count"])
+    ap2.add_argument("--box", default="all", help="all(기본)·writer 기안·approval 결재·refer 수신·read 회람/참조·reading 열람·return 반려·temp 임시저장")
+    ap2.add_argument("--status", help="상태로 거르기 — 진행·완료·반려 등")
+    ap2.add_argument("--search", help="제목·내용 등 검색어")
+    ap2.add_argument("--limit", type=int, default=30)
+    ap2.add_argument("--offset", type=int, default=0)
+    wk = sub.add_parser("work", help="근무 체크 — status 상태 · in 출근 · out 퇴근(in·out 은 --yes 없으면 미리보기만)")
+    wk.add_argument("action", choices=["status", "in", "out"])
+    wk.add_argument("--yes", action="store_true", help="실제로 기록한다(지금 시각)")
     vr = sub.add_parser("vacation-request", help="휴가 신청 — --yes 없으면 사전 검사·미리보기만")
     vr.add_argument("--start", required=True, help="YYYY-MM-DD")
     vr.add_argument("--end", help="YYYY-MM-DD(종일 기간의 마지막 날, 기본 시작일)")
@@ -967,6 +1182,10 @@ def main() -> int:
     vr.add_argument("--end-time", help="시간 단위 끝 HH:MM")
     vr.add_argument("--reason", default="", help="사유")
     vr.add_argument("--dept", help="신청 부서(기본 내 소속 중 가장 아래 부서)")
+    vr.add_argument("--approver", action="append", default=[], help="결재자 추가(신청 라인 B) — 이름 또는 아이디, 여러 번·쉼표 가능, 적은 순서가 결재 순서")
+    vr.add_argument("--processor", action="append", default=[], help="처리자 추가(C) — 이름 또는 아이디")
+    vr.add_argument("--ref", action="append", default=[], help="참조자 추가(F) — 이름 또는 아이디")
+    vr.add_argument("--no-saved-line", action="store_true", help="저장해 둔 결재선(vacation-line)을 넣지 않는다")
     vr.add_argument("--yes", action="store_true", help="실제로 신청한다(결재선에 알림이 간다)")
     a = ap.parse_args()
 
@@ -990,7 +1209,8 @@ def main() -> int:
                 print(f"로그인 성공 · {hw.username} · 세션 {hw.session_path}")
                 return 0
             how = hw.ensure(otp)
-            if a.cmd in ("mail", "vacation", "leave-calendar", "org", "person", "vacation-request"):
+            if a.cmd in ("mail", "vacation", "leave-calendar", "org", "person", "vacation-request", "work",
+                         "approval", "vacation-line"):
                 return run_api_command(hw, a)
             if a.cmd == "session":
                 print(f"{'저장 세션 재사용' if how == 'reused' else '새로 로그인'} · {hw.username}")

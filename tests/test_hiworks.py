@@ -483,5 +483,131 @@ class VacationRequestTests(ApiBase):
                 hw.vacation_request_payload("2026-12-22", "2026-12-21")
 
 
+
+class ApprovalLineTests(ApiBase):
+    CHECK_OK = VacationRequestTests.CHECK_OK
+    routes = VacationRequestTests.routes
+
+    def form_routes(self, method="BCF"):
+        r = self.routes(self.CHECK_OK)
+        r["GET /forms/vacation-request/node/2"] = FakeResponse(200, {"data": {
+            "id": 9, "approval_method": method, "line_users": [
+                {"office_user_no": 100, "node_id": 2, "approval_type": "B"},
+                {"office_user_no": 200, "node_id": 3, "approval_type": "F"}]}})
+        r["GET /v1/employees"] = FakeResponse(200, {"data": [
+            {"id": 100, "name": "홍길동", "user_id": "hong", "active": "Y"},
+            {"id": 200, "name": "참조인", "user_id": "ref", "active": "Y"},
+            {"id": 300, "name": "김결재", "user_id": "kim1", "active": "Y"},
+            {"id": 301, "name": "김결재", "user_id": "kim2", "active": "Y"},
+            {"id": 400, "name": "이처리", "user_id": "lee", "active": "Y"}]})
+        r["GET /v1/members"] = FakeResponse(200, {"data": [{"node_id": 2, "office_user_no": 100},
+                                                           {"node_id": 3, "office_user_no": 300},
+                                                           {"node_id": 3, "office_user_no": 400}]})
+        return r
+
+    def test_added_people_go_after_defaults_in_bcf_order(self):
+        self.serve(self.form_routes())
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            p = hw.vacation_request_payload("2026-12-21", approvers=["kim1"], processors="이처리", refs=["참조인", "lee"])
+        self.assertEqual([(u["approval_type"], u["office_user_no"]) for u in p["line_users"]],
+                         [("B", 100), ("B", 300), ("C", 400), ("F", 200), ("F", 400)])
+        self.assertEqual(p["line_users"][1]["node_id"], 3)
+
+    def test_same_name_twice_must_use_id(self):
+        self.serve(self.form_routes())
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            with self.assertRaises(hiworks.HiworksError) as cm:
+                hw.vacation_request_payload("2026-12-21", approvers=["김결재"])
+        self.assertIn("kim1", str(cm.exception))
+
+    def test_role_not_in_form_method_is_refused(self):
+        self.serve(self.form_routes(method="BF"))
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            with self.assertRaises(hiworks.HiworksError):
+                hw.vacation_request_payload("2026-12-21", processors=["lee"])
+
+    def test_self_cannot_be_added_as_approver(self):
+        self.serve(self.form_routes())
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            with self.assertRaises(hiworks.HiworksError):
+                hw.vacation_request_payload("2026-12-21", approvers=["hong"])
+
+
+class WorkCheckTests(ApiBase):
+    def status(self, start="Y", end="N"):
+        return FakeResponse(200, {"data": {"date": "2026-10-01", "work_status": "출근전", "start_at": "0000-00-00 00:00:00",
+                                           "end_at": "0000-00-00 00:00:00", "enable_start": start, "enable_end": end}})
+
+    def test_check_in_posts_type_1(self):
+        srv = self.serve({"GET /web/user-work-info": self.status(), "POST /web/time-record": FakeResponse(200, {})})
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            hw.record_work("in")
+        posts = [c for c in srv.calls if c[0] == "POST"]
+        self.assertEqual(posts[0][2], {"data": {"type": "1"}})
+
+    def test_check_out_refused_when_not_enabled(self):
+        srv = self.serve({"GET /web/user-work-info": self.status(end="N")})
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            with self.assertRaises(hiworks.HiworksError):
+                hw.record_work("out")
+        self.assertFalse([c for c in srv.calls if c[0] == "POST"])
+
+    def test_zero_dates_become_none(self):
+        self.serve({"GET /web/user-work-info": self.status()})
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            st = hw.work_status()
+        self.assertEqual((st["check_in"], st["can_check_in"], st["can_check_out"]), (None, True, False))
+
+
+
+class ApprovalDocumentTests(ApiBase):
+    DOCS = {"data": [{"id": 1, "document_code": "D-1", "list_status": "PROGRESS", "complete_date": None},
+                     {"id": 2, "document_code": "D-2", "list_status": None, "complete_date": "2026-09-01 10:00:00"},
+                     {"id": 3, "document_code": "D-3", "list_status": "RETURN", "complete_date": None}]}
+
+    def test_status_derivation_and_filter(self):
+        self.serve({"GET /my-documents": FakeResponse(200, self.DOCS)})
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            all_ = hw.approval_documents()
+            done = hw.approval_documents(status="완료")
+        self.assertEqual([x["status"] for x in all_["items"]], ["진행", "완료", "반려"])
+        self.assertEqual([x["code"] for x in done["items"]], ["D-2"])
+        self.assertIn("/x.com/approval/document/view/1", all_["items"][0]["url"])
+
+    def test_box_maps_to_server_filter_and_all_sends_none(self):
+        srv = self.serve({"GET /my-documents": FakeResponse(200, {"data": []})})
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            hw.approval_documents("read")
+            hw.approval_documents("all")
+            with self.assertRaises(hiworks.HiworksError):
+                hw.approval_documents("없는함")
+        urls = [c[1] for c in srv.calls]
+        self.assertIn("filter[box_status][in]=CIRCULATION,CC", urls[0])
+        self.assertNotIn("box_status", urls[1])
+
+
+class SavedLineTests(ApiBase):
+    CHECK_OK = VacationRequestTests.CHECK_OK
+    routes = VacationRequestTests.routes
+    form_routes = ApprovalLineTests.form_routes
+
+    def test_saved_line_goes_first_and_can_be_skipped(self):
+        hiworks.save_vacation_line({"approvers": ["kim1"], "processors": [], "refs": ["lee"]})
+        self.serve(self.form_routes())
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            p = hw.vacation_request_payload("2026-12-21", refs=["참조인"])
+            q = hw.vacation_request_payload("2026-12-21", use_saved_line=False)
+        self.assertEqual([(u["approval_type"], u["office_user_no"]) for u in p["line_users"]],
+                         [("B", 100), ("B", 300), ("F", 200), ("F", 400)])
+        self.assertEqual([(u["approval_type"], u["office_user_no"]) for u in q["line_users"]], [("B", 100), ("F", 200)])
+
+    def test_clearing_removes_key_and_keeps_email(self):
+        hiworks.write_private(hiworks.config_file(), {"email": "a@x.com"})
+        hiworks.save_vacation_line({"approvers": ["kim1"]})
+        self.assertEqual(hiworks.saved_vacation_line()["approvers"], ["kim1"])
+        hiworks.save_vacation_line({"approvers": [], "processors": [], "refs": []})
+        self.assertEqual(json.loads(hiworks.config_file().read_text()), {"email": "a@x.com"})
+
+
 if __name__ == "__main__":
     unittest.main()
