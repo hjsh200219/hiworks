@@ -1,6 +1,6 @@
 # hiworks — 하이웍스 로그인 세션 플러그인
 
-하이웍스(Hiworks) 로그인을 브라우저 없이 처리하고, 메일 읽기·쓰기·삭제, 내 잔여 휴가, 다른 사람 휴가 기간(전사 휴가 캘린더), 조직도·직원 조회를 JSON API 로 제공하는 Claude Code 플러그인입니다.
+하이웍스(Hiworks) 로그인을 브라우저 없이 처리하고, 메일 읽기·쓰기·삭제, 내 잔여 휴가·휴가 신청, 다른 사람 휴가 기간(전사 휴가 캘린더), 조직도·직원 조회를 JSON API 로 제공하는 Claude Code 플러그인입니다.
 [Scrapling](https://github.com/D4Vinci/Scrapling) 으로 하이웍스 로그인 API 를 직접 호출하고, 세션을 저장해 재사용합니다.
 
 - **비밀번호는 OS 키체인에만** 저장합니다(macOS 키체인 · Windows 자격 증명 관리자 · Linux Secret Service).
@@ -60,6 +60,7 @@ $HW vacation                                   # 내 휴가 발생·사용·잔�
 $HW leave-calendar --month 2026-10 [--name 홍] [--dept 개발팀]   # 누가 언제 휴가인지
 $HW org                                        # 조직도
 $HW person 홍길동                               # 직원 찾기(본인이 공개한 연락처만)
+$HW vacation-request --start 2026-12-21 [--end 2026-12-24] [--half am|pm] --reason 사유 --yes   # 휴가 신청(--yes 없으면 미리보기)
 ```
 
 플러그인 경로는 `~/.claude/plugins/cache/hiworks/hiworks/<버전>/` 입니다.

@@ -419,5 +419,69 @@ class AutoSaveTests(Base):
         self.assertFalse(hiworks.session_file().exists())
 
 
+
+class VacationRequestTests(ApiBase):
+    CHECK_OK = {"data": {"available_user_nos": [5], "remain_days_exceptions": [], "date_exceptions": []}}
+    CHECK_DUP = {"data": {"available_user_nos": [], "remain_days_exceptions": [],
+                          "date_exceptions": [{"date": "2026-12-21", "vacation_users": [5]}]}}
+
+    def routes(self, check):
+        return {**HrTests.DIR,
+                "GET /me": FakeResponse(200, {"data": {"name": "홍길동", "user_id": "hong", "office_user_no": "100"}}),
+                "GET /v1/vacation-types": FakeResponse(200, {"data": [{"id": 7, "title": "연차", "use_flag": "Y"}]}),
+                "GET /forms/vacation-request/node/2": FakeResponse(200, {"data": {
+                    "id": 9, "preserved_term": 5, "security_level": "C",
+                    "line_users": [{"office_user_no": 100, "node_id": 2, "approval_type": "B"},
+                                   {"office_user_no": False, "node_id": 2, "approval_type": "C"}]}}),
+                "POST /vacation-request-check": FakeResponse(200, check),
+                "POST /vacation-request": FakeResponse(200, {"data": {}})}
+
+    def test_range_payload_uses_period_selection(self):
+        self.serve(self.routes(self.CHECK_OK))
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            p = hw.vacation_request_payload("2026-12-18", "2026-12-22", reason="a < b")
+        self.assertEqual(p["period_selections"], [{"vacation_type_no": 7, "start_date": "2026-12-18", "end_date": "2026-12-22"}])
+        self.assertEqual((p["details"], p["user_nos"], p["form_id"], p["node_id"]), ([], [100], 9, 2))
+        self.assertEqual(p["line_users"], [{"office_user_no": 100, "node_id": 2, "approval_type": "B"}])  # 빈 자리는 뺀다
+        self.assertEqual(p["comment"], "a &lt; b")
+        self.assertNotIn("year", p)
+
+    def test_half_day_payload(self):
+        self.serve(self.routes(self.CHECK_OK))
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            p = hw.vacation_request_payload("2026-12-23", half="pm")
+            with self.assertRaises(hiworks.HiworksError):
+                hw.vacation_request_payload("2026-12-23", "2026-12-24", half="am")
+        self.assertEqual(p["details"], [{"vacation_type_no": 7, "vacation_date": "2026-12-23", "time_type": "H",
+                                         "start_time": "14:00:00", "end_time": "18:00:00", "hours": 4.0}])
+        self.assertEqual(p["year"], "2026")
+
+    def test_failed_check_never_submits(self):
+        srv = self.serve(self.routes(self.CHECK_DUP))
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            p = hw.vacation_request_payload("2026-12-21")
+            with self.assertRaises(hiworks.HiworksError) as cm:
+                hw.request_vacation(p)
+        self.assertIn("이미 휴가가 신청된 날", str(cm.exception))
+        self.assertFalse([c for c in srv.calls if c[1].endswith("/vacation-request")])
+
+    def test_passed_check_submits_wrapped_payload_once(self):
+        srv = self.serve(self.routes(self.CHECK_OK))
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            p = hw.vacation_request_payload("2026-12-21")
+            hw.request_vacation(p)
+        sent = [c for c in srv.calls if c[1].endswith("/vacation-request")]
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][2], {"data": p})
+
+    def test_unknown_type_and_reversed_dates_refused(self):
+        self.serve(self.routes(self.CHECK_OK))
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            with self.assertRaises(hiworks.HiworksError):
+                hw.vacation_request_payload("2026-12-21", vtype="없는휴가")
+            with self.assertRaises(hiworks.HiworksError):
+                hw.vacation_request_payload("2026-12-22", "2026-12-21")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,7 +1,7 @@
 ---
 name: hiworks
-description: 하이웍스(Hiworks) 로그인 세션을 브라우저 없이 만들고 재사용하며(Scrapling) 메일 읽기·쓰기·삭제, 내 잔여 휴가, 전사 휴가 캘린더(다른 사람 휴가 기간), 조직도·직원 조회를 JSON 으로 돌려준다. 트리거 — "/hiworks", "하이웍스 로그인", "하이웍스 메일", "메일 보내줘", "메일 지워줘", "받은 메일", "잔여 휴가", "남은 연차", "누구 휴가", "휴가 캘린더", "조직도", "OO 연락처", "OO 부서". 자격증명이 없으면 그 자리에서 setup 을 실행한다.
-argument-hint: "[mail|vacation|leave-calendar|org|person|status|check|session|forget]"
+description: 하이웍스(Hiworks) 로그인 세션을 브라우저 없이 만들고 재사용하며(Scrapling) 메일 읽기·쓰기·삭제, 내 잔여 휴가, 전사 휴가 캘린더(다른 사람 휴가 기간), 조직도·직원 조회를 JSON 으로 돌려준다. 트리거 — "/hiworks", "하이웍스 로그인", "하이웍스 메일", "메일 보내줘", "메일 지워줘", "받은 메일", "잔여 휴가", "남은 연차", "누구 휴가", "휴가 캘린더", "조직도", "OO 연락처", "OO 부서", "휴가 신청", "연차 써줘", "반차 신청". 자격증명이 없으면 그 자리에서 setup 을 실행한다.
+argument-hint: "[mail|vacation|vacation-request|leave-calendar|org|person|status|check|session|forget]"
 allowed-tools: Bash(uv run:*)
 ---
 
@@ -26,6 +26,7 @@ allowed-tools: Bash(uv run:*)
 | `HW vacation` | 내 휴가 종류별 발생·사용·잔여 | GET |
 | `HW leave-calendar [--month YYYY-MM] [--name 이름] [--dept 부서]` | 전사 휴가 캘린더 — 누가 언제 휴가인지(연속된 종일 휴가는 기간으로 묶음) | GET |
 | `HW org` | 조직도 — 부서 트리와 구성원(이름·직위·직책) | GET |
+| `HW vacation-request --start D [--end D] [--type 연차] [--half am\|pm] [--start-time HH:MM --end-time HH:MM] [--reason 사유] [--yes]` | 휴가 신청. **`--yes` 없으면 서버 사전 검사 + 미리보기만** | POST |
 | `HW person <이름\|아이디>` | 직원 찾기 — 부서·직위·회사 전화, 본인이 공개한 경우만 휴대폰·이메일·입사일 | GET |
 
 ## 순서
@@ -48,6 +49,14 @@ allowed-tools: Bash(uv run:*)
 - 발송이 실패해도 자동으로 다시 보내지 않는다 — 서버가 이미 받았다면 두 통이 된다. 보낸 메일함(`--box b1`)에서 확인한 뒤 사용자에게 묻는다.
 - 삭제는 기본이 휴지통 이동이다. `--permanent`(복구 불가)는 사용자가 «완전 삭제»를 분명히 말했을 때만 쓴다.
 - 「전부」「모두」 지우기 요청이면 `mail list` 로 번호를 뽑아 개수와 제목 몇 개를 보여 주고 확인을 받은 뒤 지운다.
+
+## 휴가 신청 규칙
+
+- **먼저 `--yes` 없이 실행해 미리보기(기간·추정 일수·잔여·결재선·사전 검사)를 사용자에게 보여 주고, 사용자가 신청하라고 한 뒤에만 `--yes` 를 붙인다.** 신청하면 결재선에 알림이 간다.
+- `check.ok` 가 false 면 신청하지 않는다(`--yes` 도 막힌다). `problems` 를 한국어로 전한다.
+- `warning`(추정 일수 > 잔여)이 있으면 그대로 알리고 계속할지 묻는다 — 서버는 잔여 초과를 막지 않았다.
+- 실패해도 자동으로 다시 신청하지 않는다. `leave-calendar --name 내이름` 으로 들어갔는지 먼저 본다.
+- 취소는 아직 없다 — 하이웍스 근무/경비처리 화면에서 한다.
 
 ## 다른 사람 정보
 

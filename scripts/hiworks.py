@@ -21,6 +21,8 @@
                                          전사 휴가 캘린더 — 누가 언제 휴가인지(연속된 날은 기간으로 묶음)
   org                                    조직도 — 부서 트리와 구성원
   person <이름|아이디>                   직원 찾기 — 본인이 공개한 항목만
+  vacation-request --start D [--end D] [--half am|pm] [--reason …] [--yes]
+                                         휴가 신청 — 서버 사전 검사 + 미리보기, --yes 때만 실제 신청
   forget                                 키체인 항목·설정·세션 파일 삭제
 
 자격증명 보관:
@@ -64,6 +66,13 @@
   /v1/employees?page[limit]=… · /v1/positions · /v1/jobs. 직원 휴대폰·이메일·입사일은 본인 공개 플래그(…_visible)가 Y 일 때만 내보낸다
 - 전사 휴가 캘린더: GET hr-work-api.office.hiworks.com/v4/vacation-calendar?filter[year]&filter[month][&filter[node]][&filter[search]]
   → 날짜별 행(office_user_no·vacation_type_title·type days|hours·approval_status)
+- 휴가 신청(hr-work-api /v4, 쓰기 본문은 {"data": …}):
+  GET forms/vacation-request/node/{node_id} → 양식 id·보존 기간·보안 등급·기본 결재선 line_users(approval_type B 신청·C 처리·F 참조)
+  POST vacation-request-check → available_user_nos·…_exceptions·date_exceptions[].…_users (신청서를 만들지 않는 사전 검사.
+       잔여 일수 초과는 이 검사가 막지 않았다 — 2026-10-01 실측, 그래서 미리보기가 따로 경고한다)
+  POST vacation-request {form_id, node_id, preserved_term, security_level, line_users[], comment, user_nos:[office_user_no],
+       period_selections:[{vacation_type_no, start_date, end_date}] (종일 기간) | year + details:[{…, time_type:"H", start_time,
+       end_time, hours}] (시간 단위)}. 결재선에 알림이 가는 실제 신청이다
 """
 from __future__ import annotations
 
@@ -573,6 +582,79 @@ class Hiworks:
             out = [o for o in out if q in (o["name"] or "").lower()]
         return group_vacation_periods(out)
 
+    # ---------- 휴가 신청 ----------
+
+    def _hr_work(self, method: str, path: str, data=None):
+        body = None if data is None else {"data": data}  # hr-work-api 쓰기 요청은 {"data": …} 로 감싼다
+        return self._api(method, f"{HR_WORK_API}/{path}", HR_ORIGIN, body=body)
+
+    def vacation_request_payload(self, start: str, end: str | None = None, vtype: str = "연차", half: str | None = None,
+                                 start_time: str | None = None, end_time: str | None = None, reason: str = "",
+                                 department: str | None = None) -> dict:
+        """휴가 신청 본문을 만든다(보내지 않음). 종일은 기간(start~end, 주말·공휴일은 서버가 뺀다),
+        반차는 하루만 — half="am"(09~13시)·"pm"(14~18시) 또는 start_time·end_time 직접 지정."""
+        from datetime import date, datetime
+        me, d = self.me(), self._directory()
+        types = {t["title"]: t for t in self.vacation_types()}
+        if vtype not in types:
+            raise HiworksError(f"휴가 종류 '{vtype}' 가 없습니다(가능: {', '.join(types)}).")
+        s_date, e_date = date.fromisoformat(start), date.fromisoformat(end or start)
+        if e_date < s_date:
+            raise HiworksError("끝 날짜가 시작 날짜보다 앞입니다.")
+        my_nodes = d["belongs"].get(me["office_user_no"], [])
+        if department:
+            node_id = self._node_id(department, d)
+            if node_id not in my_nodes:
+                raise HiworksError(f"'{department}' 는 내 소속 부서가 아닙니다.")
+        elif my_nodes:
+            node_id = max(my_nodes, key=lambda n: d["nodes"].get(n, {}).get("depth", 0))  # 가장 아래 부서(팀)
+        else:
+            raise HiworksError("소속 부서를 찾지 못했습니다.")
+        form = self._hr_work("GET", f"forms/vacation-request/node/{node_id}").get("data") or {}
+        payload = {
+            "form_id": form.get("id"), "node_id": node_id, "preserved_term": form.get("preserved_term"),
+            "security_level": form.get("security_level"), "comment": html_escape_lines(reason)[:1000],
+            "line_users": [{"office_user_no": u["office_user_no"], "node_id": u["node_id"], "approval_type": u["approval_type"]}
+                           for u in form.get("line_users", []) if u.get("office_user_no")],
+            "user_nos": [me["office_user_no"]],
+        }
+        type_no = types[vtype]["id"]
+        if half or start_time or end_time:
+            if s_date != e_date:
+                raise HiworksError("시간 단위(반차) 휴가는 하루씩만 신청합니다.")
+            st, et = {"am": ("09:00", "13:00"), "pm": ("14:00", "18:00")}.get(half or "", (start_time, end_time))
+            if not (st and et):
+                raise HiworksError("반차는 --half am|pm 또는 --start-time·--end-time 을 주세요.")
+            hours = (datetime.strptime(et, "%H:%M") - datetime.strptime(st, "%H:%M")).seconds / 3600
+            payload["year"] = str(s_date.year)
+            payload["details"] = [{"vacation_type_no": type_no, "vacation_date": s_date.isoformat(), "time_type": "H",
+                                   "start_time": f"{st}:00", "end_time": f"{et}:00", "hours": hours}]
+        else:
+            payload["details"] = []
+            payload["period_selections"] = [{"vacation_type_no": type_no, "start_date": s_date.isoformat(),
+                                             "end_date": e_date.isoformat()}]
+        return payload
+
+    def check_vacation_request(self, payload: dict) -> dict:
+        """서버 사전 검사(신청서는 만들지 않는다). ok=False 면 problems 에 사유."""
+        r = self._hr_work("POST", "vacation-request-check", payload).get("data") or {}
+        problems = [VACATION_CHECK_REASONS.get(k, k) for k, v in r.items()
+                    if k.endswith("_exceptions") and v and k != "date_exceptions"]
+        for ex in r.get("date_exceptions") or []:
+            for k, v in ex.items():
+                if k.endswith("_users") and v:
+                    problems.append(f"{ex.get('date', '')} {VACATION_CHECK_REASONS.get(k, k)}".strip())
+        ok = bool(r.get("available_user_nos")) and not problems
+        return {"ok": ok, "problems": problems}
+
+    def request_vacation(self, payload: dict) -> dict:
+        """휴가 신청서를 실제로 올린다 — 결재선에 알림이 간다. 사전 검사를 통과한 본문만 보낸다. 재시도 없음."""
+        check = self.check_vacation_request(payload)
+        if not check["ok"]:
+            raise HiworksError("휴가를 신청할 수 없습니다 — " + "; ".join(check["problems"] or ["사전 검사 실패"]))
+        self._hr_work("POST", "vacation-request", payload)
+        return {"requested": True, "details": payload.get("details") or payload.get("period_selections")}
+
     def _node_id(self, department: str, d: dict) -> int:
         if str(department).isdigit():
             return int(department)
@@ -592,6 +674,27 @@ def as_list(v) -> list:
     if isinstance(v, (list, tuple)):
         return [x for x in v if x not in (None, "")]
     return [x.strip() for x in str(v).split(",") if x.strip()]
+
+
+VACATION_CHECK_REASONS = {
+    "remain_days_exceptions": "잔여 일수가 부족합니다",
+    "request_days_limit_exceptions": "신청 가능 일수를 넘었습니다",
+    "unavailable_user_exceptions": "신청할 수 없는 사용자입니다",
+    "inactive_user_exceptions": "비활성 사용자입니다",
+    "rest_user_exceptions": "휴직 중이라 신청할 수 없습니다",
+    "invalid_joindate_user_exceptions": "입사일 정보 때문에 신청할 수 없습니다",
+    "vacation_users": "이미 휴가가 신청된 날입니다",
+    "duplicated_time_range_users": "이미 신청한 시간과 겹칩니다",
+    "not_in_work_time_users": "근무시간 밖입니다",
+    "in_rest_time_users": "휴게시간과 겹칩니다",
+    "time_range_limit_users": "하루 시간제 휴가 한도를 넘었습니다",
+    "start_end_time_limit_users": "시간제 휴가는 출퇴근 시간에 붙여서만 쓸 수 있습니다",
+}
+
+
+def html_escape_lines(text: str) -> str:
+    import html as _html
+    return "<br>".join(_html.escape(line) for line in (text or "").strip().splitlines())
 
 
 def summarize_mail(m: dict) -> dict:
@@ -663,6 +766,38 @@ def emit(obj) -> None:
     print(json.dumps(obj, ensure_ascii=False, indent=1))
 
 
+def weekdays_between(start: str, end: str) -> int:
+    from datetime import date, timedelta
+    d, e, n = date.fromisoformat(start), date.fromisoformat(end), 0
+    while d <= e:
+        n += d.weekday() < 5
+        d += timedelta(days=1)
+    return n
+
+
+def vacation_request_preview(hw: "Hiworks", payload: dict, vtype: str) -> dict:
+    """사람이 확인할 미리보기 — 기간·추정 일수·잔여·결재선·서버 사전 검사."""
+    d = hw._directory()
+    if payload.get("period_selections"):
+        ps = payload["period_selections"][0]
+        span, est = {"start": ps["start_date"], "end": ps["end_date"]}, weekdays_between(ps["start_date"], ps["end_date"])
+        unit = "일(주말 뺀 추정 — 공휴일은 서버가 뺀다)"
+    else:
+        x = payload["details"][0]
+        span, est, unit = {"date": x["vacation_date"], "time": f"{x['start_time'][:5]}~{x['end_time'][:5]}"}, x["hours"], "시간"
+    remaining = next((v for v in hw.my_vacation()["vacations"] if v["type"] == vtype), None)
+    out = {"type": vtype, **span, "estimate": f"{est}{unit}",
+           "department": d["nodes"].get(payload["node_id"], {}).get("node_name"),
+           "approval_line": [{"role": {"B": "신청", "C": "처리", "F": "참조"}.get(u["approval_type"], u["approval_type"]),
+                              "name": (d["people"].get(u["office_user_no"]) or {}).get("name")} for u in payload["line_users"]],
+           "reason": payload["comment"], "check": hw.check_vacation_request(payload)}
+    if remaining:
+        out["remaining_days"] = remaining["remaining_days"]
+        if payload.get("period_selections") and est > (remaining["remaining_days"] or 0):
+            out["warning"] = f"추정 {est}일이 잔여 {remaining['remaining_days']}일보다 많습니다(서버 사전 검사는 잔여를 막지 않았습니다)."
+    return out
+
+
 def run_api_command(hw: "Hiworks", a) -> int:
     if a.cmd == "vacation":
         emit(hw.my_vacation())
@@ -677,6 +812,13 @@ def run_api_command(hw: "Hiworks", a) -> int:
             raise HiworksError("--month 는 YYYY-MM 형식입니다.")
         y, mo = map(int, ym.split("-"))
         emit({"month": ym, "periods": hw.vacation_calendar(y, mo, name=a.name, department=a.dept)})
+    elif a.cmd == "vacation-request":
+        payload = hw.vacation_request_payload(a.start, a.end, a.type, a.half, a.start_time, a.end_time, a.reason, a.dept)
+        preview = vacation_request_preview(hw, payload, a.type)
+        if not a.yes:
+            emit({"preview": preview, "note": "신청하지 않았습니다. 실제로 신청하려면 --yes (결재선에 알림이 갑니다)"})
+            return 0 if preview["check"]["ok"] else 1
+        emit({**hw.request_vacation(payload), "preview": preview})
     elif a.mail_cmd == "boxes":
         emit(hw.mailboxes())
     elif a.mail_cmd == "list":
@@ -816,6 +958,16 @@ def main() -> int:
     sub.add_parser("org", help="조직도 — 부서 트리와 구성원(JSON)")
     pp = sub.add_parser("person", help="직원 찾기 — 이름·아이디·영문 이름 부분 일치(JSON)")
     pp.add_argument("query")
+    vr = sub.add_parser("vacation-request", help="휴가 신청 — --yes 없으면 사전 검사·미리보기만")
+    vr.add_argument("--start", required=True, help="YYYY-MM-DD")
+    vr.add_argument("--end", help="YYYY-MM-DD(종일 기간의 마지막 날, 기본 시작일)")
+    vr.add_argument("--type", default="연차", help="휴가 종류(기본 연차)")
+    vr.add_argument("--half", choices=["am", "pm"], help="반차 — am 09~13시, pm 14~18시")
+    vr.add_argument("--start-time", help="시간 단위 시작 HH:MM")
+    vr.add_argument("--end-time", help="시간 단위 끝 HH:MM")
+    vr.add_argument("--reason", default="", help="사유")
+    vr.add_argument("--dept", help="신청 부서(기본 내 소속 중 가장 아래 부서)")
+    vr.add_argument("--yes", action="store_true", help="실제로 신청한다(결재선에 알림이 간다)")
     a = ap.parse_args()
 
     try:
@@ -838,7 +990,7 @@ def main() -> int:
                 print(f"로그인 성공 · {hw.username} · 세션 {hw.session_path}")
                 return 0
             how = hw.ensure(otp)
-            if a.cmd in ("mail", "vacation", "leave-calendar", "org", "person"):
+            if a.cmd in ("mail", "vacation", "leave-calendar", "org", "person", "vacation-request"):
                 return run_api_command(hw, a)
             if a.cmd == "session":
                 print(f"{'저장 세션 재사용' if how == 'reused' else '새로 로그인'} · {hw.username}")
