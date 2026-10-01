@@ -1,0 +1,15 @@
+{
+  "name": "hiworks",
+  "description": "하이웍스(Hiworks) 로그인 세션 플러그인",
+  "owner": {
+    "name": "hjsh200219",
+    "url": "https://github.com/hjsh200219"
+  },
+  "plugins": [
+    {
+      "name": "hiworks",
+      "source": "./",
+      "description": "하이웍스 로그인 세션(Scrapling) — 자격증명은 OS 키체인, 세션 재사용·2단계 인증 코드 입력 지원."
+    }
+  ]
+}
