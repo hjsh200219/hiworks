@@ -15,6 +15,12 @@
   session [--no-prompt]                  살아 있으면 재사용, 죽었으면 1회 로그인(2단계 인증 코드는 입력 창)
   login [--no-prompt]                    저장 세션을 무시하고 새로 로그인
   get <url>                              세션으로 인증된 GET(API 탐색용)
+  mail boxes|list|read|send|delete       메일 — 결과 JSON. send·delete 는 --yes 없으면 미리보기만
+  vacation                               내 휴가 종류별 발생·사용·잔여(JSON)
+  leave-calendar [--month YYYY-MM] [--name 이름] [--dept 부서]
+                                         전사 휴가 캘린더 — 누가 언제 휴가인지(연속된 날은 기간으로 묶음)
+  org                                    조직도 — 부서 트리와 구성원
+  person <이름|아이디>                   직원 찾기 — 본인이 공개한 항목만
   forget                                 키체인 항목·설정·세션 파일 삭제
 
 자격증명 보관:
@@ -39,6 +45,25 @@
 
 세션 생존 판정: board.office.hiworks.com/<domain>/bbs/board/board_list 는 로그인 여부와 무관하게 HTTP 200 이고
 본문 document.location.href 가 갈린다 — 비로그인 login.office.hiworks.com, 로그인이면 다른 앱 호스트.
+세션 쿠키: 앱 호스트마다 부하분산 쿠키 lbg_* 가 붙고, 이게 세션이 저장된 서버를 고정한다. 저장하지 않으면 다음 실행이
+다른 서버로 가서 세션이 죽은 것처럼 보인다 — 그래서 세션이 확인된 실행은 종료 때 쿠키를 전부 저장한다.
+
+메일 API(mail-api.office.hiworks.com/v2, Origin mails.office.hiworks.com — 웹메일 번들에서 발굴·실측):
+- GET /mailboxes → b0 받은·b1 보낸·b2 보낼·b3 임시·b4 스팸·b5 휴지통(+사용자 메일함)
+- POST /mails/search?page[limit]=N&page[offset]=M  본문 {"mailbox_id", "subject", "from"}(평평한 키) → meta.page.total + data[]
+- GET /mails/{no} → data.message.content(HTML)·attachments. 읽음 표시는 안 바뀐다
+- 발송: POST /mails/cert-key → data(문자열) · GET /senders → 발신자 no(is_default) ·
+  POST /mails/send {cert_key, sender_no, to[], cc[], bcc[], subject, content(HTML), is_text_mode:false, is_save:true, …}
+  sender_no 는 /me/addresses 의 address_no 가 아니다(그걸 넣으면 404 sender entity not found)
+- 삭제: 휴지통 이동 POST /mails/move-bulk {"mailbox_id":"b5","no_list":[…]} · 완전 삭제 POST /mails/delete-bulk {"no_list":[…]}
+
+인사 API(Origin hr-work.office.hiworks.com — hr-work 번들에서 발굴·실측):
+- 나: GET cache-api.office.hiworks.com/me → office_user_no(계정 번호 user_no 와 다르다. 남의 번호로 휴가 요약을 부르면 401)
+- 내 휴가: GET work-api.office.hiworks.com/v1/vacation-types → /v1/user-vacation-days/office-users/{no}/vacation-types/{id}/summary
+- 조직도: GET hr-api.office.hiworks.com/v1/organizations(node_id·parent_node_id·lft) · /v1/members(node_id↔office_user_no) ·
+  /v1/employees?page[limit]=… · /v1/positions · /v1/jobs. 직원 휴대폰·이메일·입사일은 본인 공개 플래그(…_visible)가 Y 일 때만 내보낸다
+- 전사 휴가 캘린더: GET hr-work-api.office.hiworks.com/v4/vacation-calendar?filter[year]&filter[month][&filter[node]][&filter[search]]
+  → 날짜별 행(office_user_no·vacation_type_title·type days|hours·approval_status)
 """
 from __future__ import annotations
 
@@ -59,6 +84,14 @@ AUTH_API = "https://auth-api.office.hiworks.com"
 LOGIN_ORIGIN = "https://login.office.hiworks.com"
 LIVENESS_URL = "https://board.office.hiworks.com/{domain}/bbs/board/board_list"
 KEYRING_SERVICE = os.environ.get("HIWORKS_KEYRING_SERVICE", "hiworks")
+MAIL_API = "https://mail-api.office.hiworks.com/v2"
+MAIL_ORIGIN = "https://mails.office.hiworks.com"
+TRASH_MAILBOX = "b5"
+HR_ORIGIN = "https://hr-work.office.hiworks.com"
+CACHE_API = "https://cache-api.office.hiworks.com"
+WORK_API = "https://work-api.office.hiworks.com"
+HR_API = "https://hr-api.office.hiworks.com"
+HR_WORK_API = "https://hr-work-api.office.hiworks.com/v4"
 STEP_TITLES = {
     "REQUIRE_OTP_VALIDATION": "2단계 인증 코드 입력이 필요합니다",
     "REQUIRE_OTP_SETTING": "2단계 인증 설정이 필요합니다(브라우저에서 하이웍스에 로그인해 설정하세요)",
@@ -90,6 +123,14 @@ class HiworksLoginError(HiworksError):
     def __init__(self, status: int, title: str | None):
         self.status, self.title = status, title
         super().__init__(f"로그인 실패 HTTP {status} {title or ''}".strip())
+
+
+class HiworksApiError(HiworksError):
+    """로그인 뒤 API 호출이 4xx·5xx 로 거절됐다."""
+
+    def __init__(self, status: int, title: str | None, message: str | None = None):
+        self.status, self.title, self.message = status, title, message
+        super().__init__(f"API 거절 HTTP {status} {title or ''} {message or ''}".strip())
 
 
 class HiworksStepRequired(HiworksError):
@@ -256,7 +297,9 @@ class Hiworks:
         self.ip_security_level = ip_security_level
         self.session_path = session_path or session_file()
         self.password_ok = False  # 1단계(비밀번호)가 200·202 로 통과했는가 — setup 이 저장 여부를 가른다
+        self.established = False  # 이 실행에서 살아 있는 세션을 확인했는가 — 종료 때 쿠키 자동 저장 조건
         self._fs = self._s = None
+        self._cache: dict = {}
 
     def __enter__(self) -> "Hiworks":
         from scrapling.fetchers import FetcherSession
@@ -266,6 +309,10 @@ class Hiworks:
         return self
 
     def __exit__(self, *exc) -> None:
+        # 세션이 확인된 실행이면 종료 때 쿠키를 전부 저장한다. 앱 호스트마다 붙는 부하분산 쿠키(lbg_*)가 세션이 사는
+        # 서버를 고정한다 — 이걸 버리면 다음 실행이 다른 서버로 가서 멀쩡한 세션이 죽은 것으로 보인다(2026-10-01 실측).
+        if self._fs and self.established and any(c.name == "PHPSESSID" for c in self._jar().jar):
+            self.save()
         if self._fs:
             self._fs.__exit__(*exc)
         self._fs = self._s = None
@@ -318,12 +365,15 @@ class Hiworks:
                 raise
             status, body = self._post_json("/office-web/otp", {"otp_code": otp_provider()})
             data = parse_login_response(status, body)
+        self.established = True
         self.save()
         return data
 
     def is_alive(self) -> bool:
         r = self._s.get(LIVENESS_URL.format(domain=self.office_domain))
-        return r.status == 200 and is_logged_in_html(r.body.decode("utf-8", "ignore"))
+        alive = r.status == 200 and is_logged_in_html(r.body.decode("utf-8", "ignore"))
+        self.established = self.established or alive
+        return alive
 
     def ensure(self, otp_provider: Callable[[], str] | None = None) -> str:
         """저장 세션이 살아 있으면 "reused", 아니면 1회 로그인하고 "login"."""
@@ -338,8 +388,320 @@ class Hiworks:
     def post(self, url: str, **kw):
         return self._s.post(url, **kw)
 
+    # ---------- 공통 ----------
+
+    def _api(self, method: str, url: str, origin: str, *, body=None, accept: str = "application/json"):
+        """JSON API 호출. 4xx·5xx 는 HiworksApiError. 쓰기 요청도 재시도하지 않는다(retries=1)."""
+        headers = {"Origin": origin, "Referer": f"{origin}/", "accept": accept}
+        kw = {"headers": headers, "retries": 1}
+        if body is not None:
+            kw["json"] = body
+        r = getattr(self._s, method.lower())(url, **kw)
+        try:
+            data = json.loads(r.body) if r.body else {}
+        except ValueError:
+            data = {}
+        if r.status >= 400:
+            err = ((data.get("errors") or [{}])[0] or {}) if isinstance(data, dict) else {}
+            raise HiworksApiError(r.status, err.get("title") or err.get("code"), err.get("message"))
+        return data
+
+    def _memo(self, key: str, fn):
+        if key not in self._cache:
+            self._cache[key] = fn()
+        return self._cache[key]
+
+    # ---------- 메일 ----------
+
+    def _mail(self, method: str, path: str, body=None):
+        return self._api(method, f"{MAIL_API}{path}", MAIL_ORIGIN, body=body)
+
+    def mailboxes(self) -> list[dict]:
+        return [{"id": b["no"], "name": b["name"]} for b in self._mail("GET", "/mailboxes").get("data", [])]
+
+    def list_mails(self, mailbox: str = "b0", limit: int = 20, offset: int = 0,
+                   subject: str | None = None, sender: str | None = None) -> dict:
+        """메일 목록. mailbox 는 b0 받은·b1 보낸·b2 보낼·b3 임시·b4 스팸·b5 휴지통 또는 사용자 메일함 id."""
+        body = {"mailbox_id": mailbox}
+        if subject:
+            body["subject"] = subject
+        if sender:
+            body["from"] = sender
+        d = self._mail("POST", f"/mails/search?page[limit]={int(limit)}&page[offset]={int(offset)}", body)
+        page = (d.get("meta") or {}).get("page") or {}
+        return {"total": page.get("total"), "offset": page.get("offset"), "limit": page.get("limit"),
+                "items": [summarize_mail(m) for m in d.get("data", [])]}
+
+    def get_mail(self, no: int) -> dict:
+        """메일 본문. API 로 읽어도 읽음 표시는 바뀌지 않는다(2026-10-01 실측)."""
+        m = self._mail("GET", f"/mails/{int(no)}").get("data") or {}
+        out = summarize_mail(m)
+        msg = m.get("message") or {}
+        out["content_html"] = msg.get("content", "")
+        out["content_text"] = html_to_text(msg.get("content", ""))
+        out["attachments"] = [{k: a.get(k) for k in ("part_id", "name", "size", "content_type") if k in a}
+                              for a in msg.get("attachments", [])]
+        return out
+
+    def send_mail(self, to, subject: str, content: str, cc=(), bcc=(), html: bool = False) -> dict:
+        """메일 발송. 실패해도 재시도하지 않는다 — 서버가 받은 뒤 끊긴 경우 다시 보내면 두 통이 된다."""
+        to, cc, bcc = as_list(to), as_list(cc), as_list(bcc)
+        if not to:
+            raise HiworksError("받는 사람(to)이 비었습니다.")
+        cert_key = self._mail("POST", "/mails/cert-key").get("data")
+        senders = self._mail("GET", "/senders").get("data", [])  # sender_no 는 주소 번호가 아니라 발신자 번호(/senders 의 no)
+        sender = next((x for x in senders if x.get("is_default")), senders[0] if senders else None)
+        if not cert_key or sender is None:
+            raise HiworksError("발송 준비(cert-key·보내는 사람)를 받지 못했습니다.")
+        body = {
+            "cert_key": cert_key, "sender_no": sender["no"], "to": to, "cc": cc, "bcc": bcc,
+            "subject": subject or "[제목없음]", "content": content if html else text_to_html(content),
+            "is_important": False, "original_mail_no": None, "original_temp_part_id_list": [],
+            "is_encrypt": False, "is_separate_send": False, "reserve_date": None, "is_text_mode": False,
+            "is_reply": False, "is_forward": False, "response_target_mail_no": None,
+            "is_receipt_confirm": True, "is_save": True,
+        }
+        d = self._mail("POST", "/mails/send", body).get("data") or {}
+        return {"sent": True, "from": sender.get("address"), "to": to, "cc": cc, "bcc": bcc, "subject": body["subject"],
+                "send_type": d.get("send_type")}
+
+    def delete_mails(self, nos, permanent: bool = False) -> dict:
+        """기본은 휴지통(b5)으로 이동. permanent=True 면 완전 삭제(복구 불가)."""
+        no_list = [int(n) for n in as_list(nos)]
+        if not no_list:
+            raise HiworksError("삭제할 메일 번호가 없습니다.")
+        if permanent:
+            self._mail("POST", "/mails/delete-bulk", {"no_list": no_list})
+        else:
+            self._mail("POST", "/mails/move-bulk", {"mailbox_id": TRASH_MAILBOX, "no_list": no_list})
+        return {"deleted": no_list, "permanent": permanent}
+
+    # ---------- 인사(나·휴가·조직도) ----------
+
+    def me(self) -> dict:
+        d = self._memo("me", lambda: self._api("GET", f"{CACHE_API}/me", HR_ORIGIN).get("data") or {})
+        return {"name": d.get("name"), "user_id": d.get("user_id"), "office_user_no": int(d["office_user_no"])}
+
+    def vacation_types(self) -> list[dict]:
+        return self._memo("vtypes", lambda: [
+            t for t in self._api("GET", f"{WORK_API}/v1/vacation-types?page[limit]=200", HR_ORIGIN).get("data", [])
+            if t.get("use_flag") == "Y"])
+
+    def my_vacation(self) -> dict:
+        """내 휴가 종류별 발생·사용·잔여."""
+        me = self.me()
+        rows = []
+        for t in self.vacation_types():
+            s = self._api("GET", f"{WORK_API}/v1/user-vacation-days/office-users/{me['office_user_no']}"
+                                 f"/vacation-types/{t['id']}/summary", HR_ORIGIN).get("data") or {}
+            if not any(s.get(k) for k in ("created_total_hours", "used_total_hours", "remaining_total_hours")):
+                continue  # 발생도 사용도 없는 종류는 뺀다
+            rows.append({"type": t["title"], "created_days": s.get("created_days"), "created_hours": s.get("created_hours"),
+                         "used_days": s.get("used_days"), "used_hours": s.get("used_hours"),
+                         "remaining_days": s.get("remaining_days"), "remaining_hours": s.get("remaining_hours")})
+        return {"name": me["name"], "vacations": rows}
+
+    def _hr(self, path: str) -> list:
+        return self._api("GET", f"{HR_API}{path}", HR_ORIGIN).get("data", [])
+
+    def _directory(self) -> dict:
+        """조직·소속·직원·직위·직책을 한 번에 읽어 둔다(실행당 1회)."""
+        def build():
+            nodes = {n["node_id"]: n for n in self._hr("/v1/organizations")}
+            positions = {p["id"]: p["code_content"] for p in self._hr("/v1/positions")}
+            jobs = {j["id"]: j["code_content"] for j in self._hr("/v1/jobs")}
+            people = {e["id"]: e for e in self._hr("/v1/employees?page[limit]=10000")}
+            belongs: dict[int, list[int]] = {}
+            for m in self._hr("/v1/members"):
+                belongs.setdefault(m["office_user_no"], []).append(m["node_id"])
+            return {"nodes": nodes, "positions": positions, "jobs": jobs, "people": people, "belongs": belongs}
+        return self._memo("dir", build)
+
+    def _person(self, no: int, d: dict) -> dict:
+        e = d["people"].get(no) or {}
+        return public_profile(e, d, no)
+
+    def org_chart(self) -> dict:
+        """조직도 — 부서 트리와 부서별 구성원(이름·직위·직책)."""
+        d = self._directory()
+        members: dict[int, list[dict]] = {}
+        for no, node_ids in d["belongs"].items():
+            e = d["people"].get(no)
+            if not e or e.get("active") != "Y" or e.get("del_flag") == "Y":
+                continue
+            for nid in node_ids:
+                members.setdefault(nid, []).append({"name": e.get("name"), "position": d["positions"].get(e.get("position_no")),
+                                                    "job": d["jobs"].get(e.get("job_no"))})
+        children: dict = {}
+        for n in d["nodes"].values():
+            children.setdefault(n["parent_node_id"], []).append(n)
+
+        def tree(n):
+            kids = sorted(children.get(n["node_id"], []), key=lambda x: x["lft"])
+            return {"id": n["node_id"], "name": n["node_name"], "members": members.get(n["node_id"], []),
+                    "children": [tree(k) for k in kids]}
+        roots = [n for n in d["nodes"].values() if n["parent_node_id"] not in d["nodes"]]
+        return {"departments": [tree(r) for r in sorted(roots, key=lambda x: x["lft"])]}
+
+    def find_people(self, query: str) -> list[dict]:
+        """이름·아이디·영문 이름으로 직원 찾기(부분 일치). 본인이 공개하지 않은 항목은 빼고 돌려준다."""
+        q = query.strip().lower()
+        if not q:
+            raise HiworksError("찾을 이름이 비었습니다.")
+        d = self._directory()
+        hits = [no for no, e in d["people"].items() if e.get("active") == "Y" and e.get("del_flag") != "Y"
+                and any(q in (e.get(k) or "").lower() for k in ("name", "user_id", "english_name"))]
+        return [self._person(no, d) for no in hits]
+
+    def vacation_calendar(self, year: int, month: int, name: str | None = None, department: str | None = None) -> list[dict]:
+        """전사 휴가 캘린더 — 그 달에 휴가를 쓴(쓸) 사람과 날짜. 사람별로 연속된 날을 기간으로 묶는다."""
+        d = self._directory()
+        url = f"{HR_WORK_API}/vacation-calendar?filter[year]={int(year)}&filter[month]={int(month)}&page[limit]=600"
+        if department:
+            url += f"&filter[node]={self._node_id(department, d)}"
+        rows = self._api("GET", url, HR_ORIGIN).get("data", [])
+        out = []
+        for r in rows:
+            e = d["people"].get(r.get("office_user_no")) or {}
+            out.append({"name": e.get("name"), "office_user_no": r.get("office_user_no"),
+                        "departments": [d["nodes"][n]["node_name"] for n in d["belongs"].get(r.get("office_user_no"), []) if n in d["nodes"]],
+                        "date": r.get("date"), "type": r.get("vacation_type_title"), "unit": r.get("type"), "days": r.get("days"),
+                        "hours": r.get("hours"), "start_time": r.get("start_time"), "end_time": r.get("end_time"),
+                        "approval_status": r.get("approval_status")})
+        if name:
+            q = name.strip().lower()
+            out = [o for o in out if q in (o["name"] or "").lower()]
+        return group_vacation_periods(out)
+
+    def _node_id(self, department: str, d: dict) -> int:
+        if str(department).isdigit():
+            return int(department)
+        hits = ([n for n in d["nodes"].values() if n["node_name"] == department]
+                or [n for n in d["nodes"].values() if department in n["node_name"]])
+        if len(hits) != 1:
+            names = ", ".join(n["node_name"] for n in hits) or "없음"
+            raise HiworksError(f"부서 '{department}' 를 하나로 정할 수 없습니다(후보: {names}).")
+        return hits[0]["node_id"]
+
+
+# ---------- API 응답 가공 ----------
+
+def as_list(v) -> list:
+    if v is None or v == "":
+        return []
+    if isinstance(v, (list, tuple)):
+        return [x for x in v if x not in (None, "")]
+    return [x.strip() for x in str(v).split(",") if x.strip()]
+
+
+def summarize_mail(m: dict) -> dict:
+    return {"no": m.get("no"), "mailbox": m.get("mailbox_id"), "from": m.get("from"), "to": m.get("to_address", []),
+            "cc": m.get("cc_address", []), "subject": m.get("subject"), "received": m.get("received_date"),
+            "unread": m.get("is_new"), "attachments": m.get("file_attached"), "size": m.get("size")}
+
+
+def html_to_text(content: str) -> str:
+    import html as _html
+    t = re.sub(r"(?is)<(script|style).*?</\1>", "", content or "")
+    t = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>|</li>", "\n", t)
+    t = _html.unescape(re.sub(r"<[^>]+>", "", t))
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(line.rstrip() for line in t.splitlines())).strip()
+
+
+def text_to_html(text: str) -> str:
+    import html as _html
+    return "<div>" + "<br>".join(_html.escape(line) for line in (text or "").splitlines()) + "</div>"
+
+
+def public_profile(e: dict, d: dict, no: int) -> dict:
+    """직원 정보 — 본인이 공개(…_visible == "Y")한 항목만 담는다. 회사 전화·이메일 아이디·부서·직위는 공개 항목."""
+    out = {"name": e.get("name"), "english_name": e.get("english_name") or None, "user_id": e.get("user_id"),
+           "office_user_no": no, "position": d["positions"].get(e.get("position_no")), "job": d["jobs"].get(e.get("job_no")),
+           "departments": [d["nodes"][n]["node_name"] for n in d["belongs"].get(no, []) if n in d["nodes"]],
+           "phone": e.get("phone") or None, "on_leave": e.get("rest_flag") == "Y"}
+    for field, flag in (("cell", "cell_visible"), ("email", "email_visible"), ("joindate", "joindate_visible")):
+        if e.get(flag) == "Y" and e.get(field):
+            out[field] = e[field]
+    return out
+
+
+def group_vacation_periods(rows: list[dict]) -> list[dict]:
+    """같은 사람·같은 휴가 종류·같은 결재 상태의 종일 휴가가 주말만 사이에 두고 이어지면 한 기간(start~end)으로 묶는다.
+    시간 단위(반차 등)는 날마다 따로 둔다. 공휴일은 모르므로 공휴일을 사이에 둔 휴가는 두 기간으로 나온다."""
+    from datetime import date, timedelta
+
+    def only_weekend_between(a: str, b: str) -> bool:
+        d, end = date.fromisoformat(a) + timedelta(days=1), date.fromisoformat(b)
+        while d < end:
+            if d.weekday() < 5:
+                return False
+            d += timedelta(days=1)
+        return True
+
+    rows = sorted(rows, key=lambda r: (r["office_user_no"] or 0, r["type"] or "", r["date"] or ""))
+    out: list[dict] = []
+    for r in rows:
+        full_day = r.get("unit") != "hours"
+        prev = out[-1] if out else None
+        if (prev and full_day and prev["full_day"] and prev["office_user_no"] == r["office_user_no"]
+                and prev["type"] == r["type"] and prev["approval_status"] == r["approval_status"]
+                and r["date"] and only_weekend_between(prev["end"], r["date"])):
+            prev["end"] = r["date"]
+            prev["days"] = (prev["days"] or 0) + (r["days"] or 0)
+            continue
+        out.append({"name": r["name"], "office_user_no": r["office_user_no"], "departments": r["departments"],
+                    "type": r["type"], "start": r["date"], "end": r["date"], "full_day": full_day,
+                    "days": r["days"], "hours": r["hours"],
+                    "start_time": None if full_day else r["start_time"], "end_time": None if full_day else r["end_time"],
+                    "approval_status": r["approval_status"]})
+    return sorted(out, key=lambda p: (p["start"] or "", p["name"] or ""))
+
 
 # ---------- CLI ----------
+
+def emit(obj) -> None:
+    print(json.dumps(obj, ensure_ascii=False, indent=1))
+
+
+def run_api_command(hw: "Hiworks", a) -> int:
+    if a.cmd == "vacation":
+        emit(hw.my_vacation())
+    elif a.cmd == "org":
+        emit(hw.org_chart())
+    elif a.cmd == "person":
+        emit(hw.find_people(a.query))
+    elif a.cmd == "leave-calendar":
+        from datetime import date
+        ym = a.month or date.today().strftime("%Y-%m")
+        if not re.fullmatch(r"\d{4}-\d{2}", ym):
+            raise HiworksError("--month 는 YYYY-MM 형식입니다.")
+        y, mo = map(int, ym.split("-"))
+        emit({"month": ym, "periods": hw.vacation_calendar(y, mo, name=a.name, department=a.dept)})
+    elif a.mail_cmd == "boxes":
+        emit(hw.mailboxes())
+    elif a.mail_cmd == "list":
+        emit(hw.list_mails(a.box, a.limit, a.offset, a.subject, a.sender))
+    elif a.mail_cmd == "read":
+        m = hw.get_mail(a.no)
+        if not a.html:
+            m.pop("content_html", None)
+        emit(m)
+    elif a.mail_cmd == "send":
+        body = Path(a.body_file).read_text(encoding="utf-8") if a.body_file else a.body
+        preview = {"to": as_list(a.to), "cc": as_list(a.cc), "bcc": as_list(a.bcc), "subject": a.subject,
+                   "html": a.html, "body_preview": body[:300]}
+        if not a.yes:
+            emit({"preview": preview, "note": "보내지 않았습니다. 실제로 보내려면 --yes"})
+            return 0
+        emit(hw.send_mail(a.to, a.subject, body, a.cc, a.bcc, html=a.html))
+    elif a.mail_cmd == "delete":
+        if not a.yes:
+            emit({"preview": {"no_list": a.no, "permanent": a.permanent},
+                  "note": "삭제하지 않았습니다. 실제로 지우려면 --yes" + (" (완전 삭제는 복구할 수 없습니다)" if a.permanent else "")})
+            return 0
+        emit(hw.delete_mails(a.no, permanent=a.permanent))
+    return 0
+
 
 def cmd_setup(a) -> int:
     keyring_backend()  # 저장할 곳이 없으면 비밀번호를 묻기 전에 멈춘다
@@ -419,6 +781,41 @@ def main() -> int:
     g.add_argument("url")
     g.add_argument("--max", type=int, default=2000, help="출력할 본문 글자 수")
     sub.add_parser("forget", help="키체인 항목·설정·세션 삭제")
+
+    m = sub.add_parser("mail", help="메일 — 결과는 JSON").add_subparsers(dest="mail_cmd", required=True)
+    m.add_parser("boxes", help="메일함 목록")
+    ml = m.add_parser("list", help="메일 목록")
+    ml.add_argument("--box", default="b0", help="b0 받은(기본)·b1 보낸·b2 보낼·b3 임시·b4 스팸·b5 휴지통")
+    ml.add_argument("--limit", type=int, default=20)
+    ml.add_argument("--offset", type=int, default=0)
+    ml.add_argument("--subject", help="제목에 들어간 말")
+    ml.add_argument("--from", dest="sender", help="보낸 사람 주소")
+    mr = m.add_parser("read", help="메일 본문(안 읽은 메일은 읽음으로 바뀐다)")
+    mr.add_argument("no", type=int)
+    mr.add_argument("--html", action="store_true", help="HTML 본문도 함께")
+    ms = m.add_parser("send", help="메일 발송 — --yes 없으면 미리보기만")
+    ms.add_argument("--to", required=True, help="받는 사람(쉼표로 여러 명)")
+    ms.add_argument("--cc", default="")
+    ms.add_argument("--bcc", default="")
+    ms.add_argument("--subject", required=True)
+    g2 = ms.add_mutually_exclusive_group(required=True)
+    g2.add_argument("--body", help="본문(텍스트)")
+    g2.add_argument("--body-file", help="본문 파일(텍스트, --html 이면 HTML)")
+    ms.add_argument("--html", action="store_true", help="본문을 HTML 로 보낸다")
+    ms.add_argument("--yes", action="store_true", help="실제로 보낸다")
+    md = m.add_parser("delete", help="메일 삭제(기본 휴지통 이동) — --yes 없으면 미리보기만")
+    md.add_argument("no", type=int, nargs="+")
+    md.add_argument("--permanent", action="store_true", help="완전 삭제(복구 불가)")
+    md.add_argument("--yes", action="store_true", help="실제로 삭제한다")
+
+    sub.add_parser("vacation", help="내 휴가 종류별 발생·사용·잔여(JSON)")
+    lc = sub.add_parser("leave-calendar", help="전사 휴가 캘린더 — 누가 언제 휴가인지(JSON)")
+    lc.add_argument("--month", help="YYYY-MM (기본 이번 달)")
+    lc.add_argument("--name", help="이름(부분 일치)")
+    lc.add_argument("--dept", help="부서 이름(부분 일치) 또는 id")
+    sub.add_parser("org", help="조직도 — 부서 트리와 구성원(JSON)")
+    pp = sub.add_parser("person", help="직원 찾기 — 이름·아이디·영문 이름 부분 일치(JSON)")
+    pp.add_argument("query")
     a = ap.parse_args()
 
     try:
@@ -441,11 +838,12 @@ def main() -> int:
                 print(f"로그인 성공 · {hw.username} · 세션 {hw.session_path}")
                 return 0
             how = hw.ensure(otp)
+            if a.cmd in ("mail", "vacation", "leave-calendar", "org", "person"):
+                return run_api_command(hw, a)
             if a.cmd == "session":
                 print(f"{'저장 세션 재사용' if how == 'reused' else '새로 로그인'} · {hw.username}")
                 return 0
             r = hw.get(a.url)
-            hw.save()  # 앱별 lbg_* 쿠키도 다음 실행에 쓴다
             print(f"HTTP {r.status} {r.url}")
             print(r.body.decode("utf-8", "ignore")[: a.max])
             return 0 if r.status < 400 else 1

@@ -1,6 +1,6 @@
 # hiworks — 하이웍스 로그인 세션 플러그인
 
-하이웍스(Hiworks) 로그인을 브라우저 없이 처리하는 Claude Code 플러그인입니다.
+하이웍스(Hiworks) 로그인을 브라우저 없이 처리하고, 메일 읽기·쓰기·삭제, 내 잔여 휴가, 다른 사람 휴가 기간(전사 휴가 캘린더), 조직도·직원 조회를 JSON API 로 제공하는 Claude Code 플러그인입니다.
 [Scrapling](https://github.com/D4Vinci/Scrapling) 으로 하이웍스 로그인 API 를 직접 호출하고, 세션을 저장해 재사용합니다.
 
 - **비밀번호는 OS 키체인에만** 저장합니다(macOS 키체인 · Windows 자격 증명 관리자 · Linux Secret Service).
@@ -48,6 +48,18 @@ $HW session                         # 세션 재사용 또는 로그인 1회
 $HW check                           # 세션 생존 확인(로그인 안 함)
 $HW get <url>                       # 로그인된 상태로 GET
 $HW forget                          # 키체인 항목·설정·세션 삭제
+
+# 메일 (결과는 JSON)
+$HW mail list [--box b0] [--subject 말] [--from 주소] [--limit 20] [--offset 0]
+$HW mail read <번호>
+$HW mail send --to a@x.com --subject 제목 --body 본문 --yes      # --yes 없으면 미리보기만
+$HW mail delete <번호>... [--permanent] --yes                     # 기본 휴지통 이동
+
+# 인사
+$HW vacation                                   # 내 휴가 발생·사용·잔여
+$HW leave-calendar --month 2026-10 [--name 홍] [--dept 개발팀]   # 누가 언제 휴가인지
+$HW org                                        # 조직도
+$HW person 홍길동                               # 직원 찾기(본인이 공개한 연락처만)
 ```
 
 플러그인 경로는 `~/.claude/plugins/cache/hiworks/hiworks/<버전>/` 입니다.
@@ -69,6 +81,10 @@ $HW forget                          # 키체인 항목·설정·세션 삭제
 - **원격 접속 중 등록**: 휴대폰 Remote Control 처럼 컴퓨터 화면을 볼 수 없으면 비밀번호 창도 볼 수 없습니다. 그때는 컴퓨터 앞에서 터미널로 `setup` 을 실행하세요.
 - **IP 보안**: 기본은 하이웍스 브라우저 로그인과 같은 1단계(C클래스 대역)입니다. 네트워크가 바뀌면 세션이 끊기고 `session` 이 다시 로그인합니다. `--ip-level -1|1|2` 로 바꿀 수 있습니다.
 - 2단계 인증 설정·비밀번호 변경 요구·로그인 제한 확인은 처리하지 않습니다. 브라우저에서 하이웍스에 로그인해 끝내세요.
+
+## 개인정보
+
+`person`·`org`·`leave-calendar` 는 로그인한 계정이 하이웍스 화면에서 볼 수 있는 범위만 돌려줍니다. 휴대폰·이메일·입사일은 그 직원이 공개로 설정한 경우에만 내보냅니다. 결과를 회사 밖으로 옮기지 마세요.
 
 ## 라이선스
 
