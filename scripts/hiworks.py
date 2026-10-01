@@ -361,7 +361,7 @@ def cmd_setup(a) -> int:
     email = (email or ask("하이웍스 이메일(아이디@회사도메인)", hidden=False)).strip()
     if "@" not in email:
         raise HiworksError("이메일은 아이디@회사도메인 형식이어야 합니다.")
-    password = sys.stdin.read().rstrip("\r\n") if a.password_stdin else ask(f"{email} 하이웍스 비밀번호", hidden=True, username=email)
+    password = sys.stdin.read().rstrip("\r\n") if a.password_stdin else ask(f"{email} 하이웍스 비밀번호 (영문 입력 상태인지 확인하세요 — 입력값은 점으로만 보입니다)", hidden=True, username=email)
     if not password:
         raise HiworksError("비밀번호가 비어 있습니다.")
     with Hiworks(username=email, password=password, ip_security_level=a.ip_level) as hw:
