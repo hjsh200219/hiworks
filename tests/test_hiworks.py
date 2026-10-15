@@ -221,6 +221,45 @@ class SetupTests(Base):
         self.assertEqual(list(Path(self.tmp.name).iterdir()), [])
 
 
+class MacKeychainTests(Base):
+    """macOS /usr/bin/security 경로 — 실제 키체인은 건드리지 않고 subprocess 를 가짜로 바꾼다."""
+
+    def test_memory_keyring_is_not_mac_path(self):
+        self.assertFalse(hiworks.mac_security(keyring.get_keyring()))
+
+    def test_quote_escapes_backslash_and_quote(self):
+        self.assertEqual(hiworks._security_quote('a"b\\c'), '"a\\"b\\\\c"')
+
+    def test_read_timeout_explains_prompt(self):
+        import subprocess
+        with patch.object(hiworks.subprocess, "run", side_effect=subprocess.TimeoutExpired("security", 60)):
+            with self.assertRaises(hiworks.HiworksError) as cm:
+                hiworks.mac_read("a@x.com")
+        self.assertIn("항상 허용", str(cm.exception))
+
+    def test_read_strips_one_newline_and_missing_is_none(self):
+        ok = SimpleNamespace(returncode=0, stdout="pw \n", stderr="")
+        with patch.object(hiworks.subprocess, "run", return_value=ok):
+            self.assertEqual(hiworks.mac_read("a@x.com"), "pw ")
+        missing = SimpleNamespace(returncode=44, stdout="", stderr="not found")
+        with patch.object(hiworks.subprocess, "run", return_value=missing):
+            self.assertIsNone(hiworks.mac_read("a@x.com"))
+
+    def test_write_sends_password_on_stdin_not_argv(self):
+        calls = []
+
+        def fake(cmd, **kw):
+            calls.append((cmd, kw))
+            return SimpleNamespace(returncode=0, stdout="s3cr\"et\n", stderr="")
+        with patch.object(hiworks.subprocess, "run", side_effect=fake):
+            hiworks.mac_write("a@x.com", 's3cr"et')
+        cmd, kw = calls[0]
+        self.assertEqual(cmd, [hiworks.SECURITY_BIN, "-i"])
+        self.assertNotIn("s3cr", " ".join(cmd))
+        self.assertIn('-T /usr/bin/security', kw["input"])
+        self.assertIn('-w "s3cr\\"et"', kw["input"])
+
+
 class AskTests(unittest.TestCase):
     def test_no_tty_no_gui_refuses(self):
         with patch("sys.stdin", io.StringIO("")), patch.object(hiworks.sys, "platform", "linux"), \

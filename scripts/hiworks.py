@@ -35,6 +35,7 @@
   vacation-request --start D [--end D] [--half am|pm] [--reason …] [--yes]
                                          휴가 신청 — 서버 사전 검사 + 미리보기, --yes 때만 실제 신청
   forget                                 키체인 항목·설정·세션 파일 삭제
+  keychain-migrate                       (macOS) 옛 키체인 항목을 /usr/bin/security 전용으로 옮김 — Python 버전이 바뀌어도 접근 창 안 뜸
 
 자격증명 보관:
 - 이메일(비밀 아님) → $HIWORKS_HOME/config.json (기본 ~/.hiworks, 0600)
@@ -252,13 +253,82 @@ def stored_password(email: str) -> tuple[str | None, str]:
     if os.environ.get("HIWORKS_PASSWORD"):
         return os.environ["HIWORKS_PASSWORD"], "환경변수 HIWORKS_PASSWORD"
     kr = keyring_backend()
+    if mac_security(kr):
+        pw = mac_read(email)
+        if pw is not None:
+            return pw, f"macOS 키체인(/usr/bin/security) 서비스 {KEYRING_SERVICE}"
     pw = kr.get_password(KEYRING_SERVICE, email)
     return (pw, f"키체인({type(kr).__name__}) 서비스 {KEYRING_SERVICE}") if pw else (None, "")
 
 
 def store_credentials(email: str, password: str) -> None:
-    keyring_backend().set_password(KEYRING_SERVICE, email, password)
+    kr = keyring_backend()
+    if mac_security(kr):
+        mac_write(email, password)
+    else:
+        kr.set_password(KEYRING_SERVICE, email, password)
     write_private(config_file(), {"email": email, "saved_at": int(time.time())})
+
+
+# macOS 키체인은 항목마다 «읽어도 되는 프로그램»을 실행 파일 서명으로 기억한다. uv 가 받은 Python 은
+# ad-hoc 서명이라 버전이 바뀔 때마다 다른 프로그램으로 보여 「키체인 접근 허용」 창이 다시 뜬다 —
+# 무인·원격 실행에서는 그 창에서 멈춘다. Apple 이 서명한 /usr/bin/security 로 읽고 쓰면 허용 목록이
+# Python 버전과 상관없어진다.
+SECURITY_BIN = "/usr/bin/security"
+SECURITY_TIMEOUT = 60
+
+
+def mac_security(kr) -> bool:
+    """macOS 기본 키체인 백엔드이고 /usr/bin/security 가 있을 때만 True(테스트용 메모리 키체인 등은 False)."""
+    return (sys.platform == "darwin" and os.path.exists(SECURITY_BIN)
+            and type(kr).__module__.startswith("keyring.backends.macOS"))
+
+
+def _security_quote(value: str) -> str:
+    # `security -i` 의 줄 해석 규칙: 큰따옴표 안에서 \ 와 \" 만 이스케이프.
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def mac_read(email: str) -> str | None:
+    """키체인 비밀번호. 항목이 없거나 security 가 거절하면 None(호출부가 keyring 으로 다시 읽는다)."""
+    try:
+        r = subprocess.run([SECURITY_BIN, "find-generic-password", "-s", KEYRING_SERVICE, "-a", email, "-w"],
+                           capture_output=True, text=True, timeout=SECURITY_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise HiworksError("키체인 접근 승인 창이 떠 있어 비밀번호를 읽지 못했습니다. 이 Mac 화면에서 "
+                           "「항상 허용」을 누르고 다시 실행하세요.") from None
+    if r.returncode != 0:
+        return None
+    return r.stdout[:-1] if r.stdout.endswith("\n") else r.stdout
+
+
+def mac_write(email: str, password: str) -> None:
+    """비밀번호를 명령 인자(ps 로 보임)가 아니라 표준 입력으로 넘겨 /usr/bin/security 만 읽게 저장한다."""
+    line = (f"add-generic-password -U -s {_security_quote(KEYRING_SERVICE)} -a {_security_quote(email)} "
+            f"-T {SECURITY_BIN} -w {_security_quote(password)}\n")
+    try:
+        r = subprocess.run([SECURITY_BIN, "-i"], input=line, capture_output=True, text=True, timeout=SECURITY_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise HiworksError("키체인 저장이 승인 창에서 멈췄습니다. 이 Mac 화면에서 허용한 뒤 다시 실행하세요.") from None
+    if r.returncode != 0 or mac_read(email) != password:
+        raise HiworksError(f"macOS 키체인 저장 실패(security 종료 코드 {r.returncode}).")
+
+
+def mac_migrate(email: str) -> str:
+    """keyring(Python)이 만든 옛 항목을 /usr/bin/security 전용 항목으로 바꾼다. 실패하면 옛 값으로 되돌린다."""
+    kr = keyring_backend()
+    if not mac_security(kr):
+        return "macOS 키체인이 아니라 할 일 없음"
+    pw = kr.get_password(KEYRING_SERVICE, email)
+    if pw is None:
+        return "저장된 비밀번호 없음"
+    kr.delete_password(KEYRING_SERVICE, email)
+    try:
+        mac_write(email, pw)
+    except Exception:
+        kr.set_password(KEYRING_SERVICE, email, pw)
+        raise
+    return "옮김 — 이제 Python 버전이 바뀌어도 키체인 창이 뜨지 않습니다"
 
 
 def forget_credentials() -> list[str]:
@@ -266,7 +336,12 @@ def forget_credentials() -> list[str]:
     email = read_json(config_file()).get("email")
     if email:
         try:
-            keyring_backend().delete_password(KEYRING_SERVICE, email)
+            kr = keyring_backend()
+            if mac_security(kr):
+                subprocess.run([SECURITY_BIN, "delete-generic-password", "-s", KEYRING_SERVICE, "-a", email],
+                               capture_output=True, timeout=SECURITY_TIMEOUT, check=True)
+            else:
+                kr.delete_password(KEYRING_SERVICE, email)
             done.append(f"키체인 항목({KEYRING_SERVICE} / {email})")
         except Exception:  # noqa: BLE001 — 항목이 없거나 백엔드가 없으면 지울 것도 없다
             pass
@@ -1470,6 +1545,7 @@ def main() -> int:
     g.add_argument("url")
     g.add_argument("--max", type=int, default=2000, help="출력할 본문 글자 수")
     sub.add_parser("forget", help="키체인 항목·설정·세션 삭제")
+    sub.add_parser("keychain-migrate", help="(macOS) 키체인 항목을 /usr/bin/security 전용으로 옮김")
 
     m = sub.add_parser("mail", help="메일 — 결과는 JSON").add_subparsers(dest="mail_cmd", required=True)
     m.add_parser("boxes", help="메일함 목록")
@@ -1580,6 +1656,12 @@ def main() -> int:
         if a.cmd == "forget":
             done = forget_credentials()
             print("삭제: " + (", ".join(done) if done else "지울 것이 없습니다"))
+            return 0
+        if a.cmd == "keychain-migrate":
+            email, _ = configured_email()
+            if not email:
+                raise HiworksError("등록된 계정이 없습니다. 먼저 setup 을 실행하세요.")
+            print(mac_migrate(email))
             return 0
         with Hiworks(ip_security_level=a.ip_level) as hw:
             otp = None if getattr(a, "no_prompt", False) else ask_otp
