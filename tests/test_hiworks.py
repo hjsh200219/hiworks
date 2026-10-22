@@ -695,6 +695,25 @@ class ApprovalPendingTests(ApiBase):
         with self.assertRaises(hiworks.HiworksError):
             hiworks.parse_pending_row({"checkbox": "", "title": "getView('7')"}, "x.com")
 
+    def test_document_no_comes_from_link_not_drafter_title(self):
+        row = dict(self.ROW, title="<div title=\"getView('9')\"><a onclick=\"ApprovalDocument.getView('7')\">getView('9')</a></div>")
+        self.assertEqual(hiworks.parse_pending_row(row, "x.com")["document_no"], 7)
+        with self.assertRaises(hiworks.HiworksError):  # 제목 링크와 link 가 다른 문서를 가리키면 거절
+            hiworks.parse_pending_row(dict(self.ROW, link="javascript:ApprovalDocument.getView('9', 'W');"), "x.com")
+
+    def test_same_document_twice_in_waiting_list_stops(self):
+        other = dict(self.ROW, checkbox=self.ROW["checkbox"].replace('"55"', '"56"'))
+        state = {"n": 0}
+
+        def ajax(kw):
+            state["n"] += 1
+            return FakeResponse(200, {"resultCode": "SUCCESS", "result": [self.ROW, other] if state["n"] == 1 else []})
+        srv = self.serve({"POST /approval/document_ajax/": ajax})
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            with self.assertRaises(hiworks.HiworksError):
+                hw.approve_documents([7])
+        self.assertNotIn("approval_action", self.menus(srv))
+
 
 class SavedLineTests(ApiBase):
     CHECK_OK = VacationRequestTests.CHECK_OK
