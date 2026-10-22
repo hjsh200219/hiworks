@@ -290,18 +290,19 @@ class AskTests(unittest.TestCase):
 
 
 class FakeServer:
-    """URL 끝부분으로 가짜 응답을 고른다. calls 에 (method, url, json) 을 남긴다."""
+    """URL 끝부분으로 가짜 응답을 고른다. calls 에 (method, url, json 또는 폼 data) 를 남긴다.
+    응답 자리에 함수를 두면 요청 kw 로 불러 응답을 만든다(상태가 바뀌는 서버 흉내)."""
 
     def __init__(self, routes):
         self.routes, self.calls = routes, []
 
     def handler(self, method):
         def call(_self, url, **kw):
-            self.calls.append((method, url, kw.get("json")))
+            self.calls.append((method, url, kw["json"] if "json" in kw else kw.get("data")))
             for key, resp in self.routes.items():
                 m, frag = key.split(" ", 1)
                 if m == method and frag in url:
-                    return resp
+                    return resp(kw) if callable(resp) else resp
             return FakeResponse(404, errors("NOT_FOUND"))
         return call
 
@@ -623,6 +624,76 @@ class ApprovalDocumentTests(ApiBase):
         urls = [c[1] for c in srv.calls]
         self.assertIn("filter[box_status][in]=CIRCULATION,CC", urls[0])
         self.assertNotIn("box_status", urls[1])
+
+
+class ApprovalPendingTests(ApiBase):
+    ROW = {"checkbox": '<label><input type="checkbox" class="js-checkbox-approval-lists" value="55"></label>',
+           "document_code": "<div title='D-7'>D-7</div>",
+           "title": "<div title=\"t\"><a onclick=\"ApprovalDocument.getView('7')\">휴가 신청 &amp; 연차</a></div>",
+           "register": '<div title="기안자">기안자</div>', "type": '<div title="신청">신청</div>',
+           "document_regdate": "2026-01-02", "document_regdate_title": "2026-01-02 09:00:00",
+           "link": "javascript:ApprovalDocument.getView('7', 'W');"}
+
+    def server(self, approve_result="SUCCESS", clears=True):
+        """대기 목록은 승인 호출 전엔 ROW 한 줄(어느 쪽이든 같은 줄), 승인이 받아들여지고 clears 면 빈 목록."""
+        state = {"waiting": True}
+
+        def ajax(kw):
+            d = kw.get("data") or {}
+            if d.get("pMenu") == "get_document_list":
+                rows = [self.ROW] if state["waiting"] else []
+                return FakeResponse(200, {"resultCode": "SUCCESS", "result": rows, "message": "문서가 존재하지 않습니다."})
+            if d.get("pMenu") == "approval_action":
+                if approve_result == "SUCCESS" and clears:
+                    state["waiting"] = False
+                return FakeResponse(200, {"resultCode": approve_result, "message": "처리 결과"})
+            return FakeResponse(200, {"resultCode": "FAIL"})
+        return self.serve({"POST /approval/document_ajax/": ajax})
+
+    def menus(self, srv):
+        return [c[2].get("pMenu") for c in srv.calls if isinstance(c[2], dict)]
+
+    def test_pending_parses_html_rows_and_stops_on_repeated_page(self):
+        srv = self.server()
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            out = hw.approval_pending()
+        self.assertEqual(out["count"], 1)  # 같은 줄이 다음 쪽에도 오면 거기서 멈춘다
+        item = out["items"][0]
+        self.assertEqual((item["document_no"], item["approval_no"], item["code"], item["title"], item["drafter"]),
+                         (7, 55, "D-7", "휴가 신청 & 연차", "기안자"))
+        self.assertIn("/x.com/approval/document/view/7", item["url"])
+        self.assertEqual([c[2]["pStatus"] for c in srv.calls], ["W", "W"])
+
+    def test_approve_sends_my_approval_no_and_confirms_it_left_waiting(self):
+        srv = self.server()
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            out = hw.approve_documents([7])
+        action = [c[2] for c in srv.calls if c[2].get("pMenu") == "approval_action"]
+        self.assertEqual([a["pNo[]"] for a in action], [["55"]])  # 문서 번호가 아니라 내 결재 칸 번호
+        self.assertEqual(([x["document_no"] for x in out["approved"]], out["not_approved"]), ([7], []))
+
+    def test_document_not_waiting_sends_nothing(self):
+        srv = self.server()
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            with self.assertRaises(hiworks.HiworksError):
+                hw.approve_documents([7, 8])  # 8 은 내 차례가 아니다 — 7 도 보내지 않는다
+        self.assertNotIn("approval_action", self.menus(srv))
+
+    def test_success_message_alone_is_not_trusted(self):
+        self.server(clears=False)
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            out = hw.approve_documents([7])
+        self.assertEqual((out["approved"], [x["document_no"] for x in out["not_approved"]]), ([], [7]))
+
+    def test_server_refusal_raises(self):
+        self.server(approve_result="FAIL")
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            with self.assertRaises(hiworks.HiworksError):
+                hw.approve_documents([7])
+
+    def test_changed_row_format_raises_instead_of_guessing(self):
+        with self.assertRaises(hiworks.HiworksError):
+            hiworks.parse_pending_row({"checkbox": "", "title": "getView('7')"}, "x.com")
 
 
 class SavedLineTests(ApiBase):

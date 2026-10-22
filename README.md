@@ -1,6 +1,6 @@
 # hiworks — 하이웍스 로그인 세션 플러그인
 
-하이웍스(Hiworks) 로그인을 브라우저 없이 처리하고, 메일 읽기·쓰기(첨부·답장·전달)·삭제, 내 잔여 휴가·휴가 신청·취소(결재선 저장), 다른 사람 휴가 기간(전사 휴가 캘린더), 출근·퇴근 체크, 전자결재 문서 조회, 일정 조회·등록, 아침 요약, 조직도·직원 조회를 JSON API 로 제공하는 Claude Code 플러그인입니다.
+하이웍스(Hiworks) 로그인을 브라우저 없이 처리하고, 메일 읽기·쓰기(첨부·답장·전달)·삭제, 내 잔여 휴가·휴가 신청·취소(결재선 저장), 다른 사람 휴가 기간(전사 휴가 캘린더), 출근·퇴근 체크, 전자결재 문서 조회·결재 대기 문서 승인(확인 뒤), 일정 조회·등록, 아침 요약, 조직도·직원 조회를 JSON API 로 제공하는 Claude Code 플러그인입니다.
 [Scrapling](https://github.com/D4Vinci/Scrapling) 으로 하이웍스 로그인 API 를 직접 호출하고, 세션을 저장해 재사용합니다.
 
 - **비밀번호는 OS 키체인에만** 저장합니다(macOS 키체인 · Windows 자격 증명 관리자 · Linux Secret Service).
@@ -65,6 +65,8 @@ $HW vacation-request --start 2026-12-21 [--end 2026-12-24] [--half am|pm] --reas
 $HW vacation-line set --approver 팀장 --ref 동료           # 휴가 결재선 저장(이후 신청에 자동 반영) · show/add/remove/clear
 $HW work status | $HW work in --yes | $HW work out --yes   # 근무 체크(지금 시각으로 기록)
 $HW approval list [--box writer] [--status 진행]           # 전자결재 내 문서·상태 · approval count
+$HW approval pending                                       # 지금 내가 결재할 차례인 문서
+$HW approval approve <문서번호> [--yes]                     # 승인(--yes 없으면 미리보기 — 확인 뒤에만 --yes)
 $HW today                                                  # 아침 요약
 $HW mail send --to a@x.com --subject 제목 --body 본문 --attach 파일 --yes   # 첨부 · --reply-to/--forward 번호
 $HW calendar list · calendar add --title 회의 --start "2026-10-02 14:00" --yes   # 일정

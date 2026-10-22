@@ -25,6 +25,8 @@
   approval list [--box all|writer|approval|refer|read|reading|return|temp] [--status 진행|완료|반려] [--search 말]
   approval count                         전자결재 — 내 문서 목록·상태, 결재할 문서 수
   approval line <문서번호>               그 문서의 결재선(줄별 역할·사람)
+  approval pending                       지금 내가 결재할 차례인 문서(웹 「대기」)
+  approval approve <문서번호>... [--yes] 대기 문서 승인(--yes 없으면 미리보기만)
   mail send … [--attach 파일] [--reply-to N | --forward N]  첨부·답장·전달 · mail attachment <no> <part|all>
   vacation-cancel --start D [--end D] [--reason …] [--yes]  휴가 취소 신청(--yes 때만)
   calendar list|add|delete|calendars     일정 조회·등록·삭제(add·delete 는 --yes 때만)
@@ -85,6 +87,14 @@
   (필터 없으면 전부) · GET my-documents/count · GET temp-documents. 상태: list_status(PROGRESS 등)가 있으면 그것,
   없으면 complete_date 가 있으면 완료. 결재할 문서 수: POST approval.office.hiworks.com/{domain}/approval/document_ajax/
   pMenu=get_approval_count(폼 전송) → result.w 대기·e 예정·p 진행·v 확인·a 전체
+- 결재 대기·승인(옛 화면 ajax, 폼 전송, 응답 resultCode SUCCESS|FAIL·message):
+  POST …/approval/document_ajax/ pMenu=get_document_list&pStatus=W&page=N → result[] 행은 HTML 조각 —
+  checkbox 의 value = 내 결재 칸 번호(approval no), title 의 getView('문서번호'). (result 가 있어도 message 가
+  「문서가 존재하지 않습니다.」일 수 있어 result 로만 판단한다.)
+  승인은 대기 목록의 「결재」 버튼(ApprovalDocument.batchAction)과 같은 호출 — POST …/document_ajax/
+  pMenu=approval_action&pNo[]=<결재 칸 번호>…&pListMode= . 내 차례가 아닌 칸이면 서버가 거절한다
+  (문서 보기 화면의 process_ajax get_approval_layer 는 「결재할 수 있는 권한이 없습니다.」). 반려·의견은
+  문서 보기 화면의 process_ajax approval_action(pValue·pMessage) 경로이며 아직 넣지 않았다.
 - 결재선 조회: 문서 보기 화면 approval.office.hiworks.com/{domain}/approval/document/view/{no} 의 인라인 스크립트
   ApprovalProcess._firstLine…_sixthLine = '직원번호,…' · _approvalMethod(BCF 등, 글자 순서 = 줄 역할) · _registerNo(기안자).
   열람 권한이 없거나 없는 문서면 alert("존재하지 않은 문서입니다.") — 2026-10-01 실측: 내 휴가 내역(my-vacations/use-details
@@ -1016,6 +1026,7 @@ class Hiworks:
 
         part("unread_mail", unread)
         part("approval", self.approval_counts)
+        part("approval_pending", lambda: self.approval_pending()["items"])
         part("schedules", lambda: self.schedules(today.isoformat(), today.isoformat()))
         part("work", self.work_status)
         part("team_on_leave", leave)
@@ -1123,6 +1134,48 @@ class Hiworks:
         names = {"w": "대기", "e": "예정", "p": "진행", "v": "확인", "a": "전체"}
         return {"to_do": {names[k]: c.get(k) for k in names if k in c}, "my_documents_total": total}
 
+    def _approval_ajax(self, path: str, data: dict) -> dict:
+        """옛 전자결재 화면의 폼 전송 ajax(document_ajax 등). resultCode 가 SUCCESS 가 아니면 HiworksError."""
+        r = self._s.post(f"{APPROVAL_ORIGIN}/{self.office_domain}/approval/{path}/", retries=1, data=data,
+                         headers={"Origin": APPROVAL_ORIGIN, "X-Requested-With": "XMLHttpRequest"})
+        try:
+            d = json.loads(r.body) if r.body else {}
+        except ValueError:
+            d = {}
+        if r.status >= 400 or not isinstance(d, dict) or d.get("resultCode") != "SUCCESS":
+            msg = d.get("message") if isinstance(d, dict) else None
+            raise HiworksError(f"전자결재 요청이 거절됐습니다(HTTP {r.status}): {msg or '알 수 없는 응답'}")
+        return d
+
+    def approval_pending(self) -> dict:
+        """지금 내가 결재할 차례인 문서(웹 「진행 중인 문서 › 대기」). approval_no 는 승인에 쓰는 내 결재 칸 번호."""
+        items, seen = [], set()
+        for page in range(1, 11):  # 쪽 크기를 몰라 빈 쪽이나 이미 본 행이 나올 때까지(최대 10쪽)
+            rows = self._approval_ajax("document_ajax", {"pMenu": "get_document_list", "pStatus": "W",
+                                                         "page": str(page), "pCallback": "x"}).get("result") or []
+            new = [x for x in (parse_pending_row(r, self.office_domain) for r in rows) if x["approval_no"] not in seen]
+            if not new:
+                break
+            seen.update(x["approval_no"] for x in new)
+            items += new
+        return {"count": len(items), "items": items}
+
+    def approve_documents(self, document_nos: list[int]) -> dict:
+        """대기 문서를 승인한다. 대기 목록에 없는 문서가 하나라도 있으면 아무것도 보내지 않는다.
+        승인 뒤 대기 목록을 다시 읽어 빠졌는지로 결과를 판정한다(서버 메시지만 믿지 않는다)."""
+        pending = {x["document_no"]: x for x in self.approval_pending()["items"]}
+        missing = [n for n in document_nos if n not in pending]
+        if missing:
+            raise HiworksError(f"지금 내가 결재할 차례인 문서가 아닙니다: {', '.join(map(str, missing))} "
+                               f"(대기 {len(pending)}건 — approval pending 으로 확인)")
+        targets = [pending[n] for n in dict.fromkeys(document_nos)]
+        d = self._approval_ajax("document_ajax", {"pMenu": "approval_action", "pListMode": "", "pCallback": "x",
+                                                  "pNo[]": [str(x["approval_no"]) for x in targets]})
+        still = {x["document_no"] for x in self.approval_pending()["items"]}
+        return {"approved": [x for x in targets if x["document_no"] not in still],
+                "not_approved": [x for x in targets if x["document_no"] in still],
+                "server_message": d.get("message")}
+
     def _node_id(self, department: str, d: dict) -> int:
         if str(department).isdigit():
             return int(department)
@@ -1188,6 +1241,23 @@ def utc_to_local(value: str | None) -> str | None:
     if not value:
         return None
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def _text(fragment: str | None) -> str:
+    import html as _html
+    return _html.unescape(re.sub(r"<[^>]+>", "", fragment or "")).strip()
+
+
+def parse_pending_row(x: dict, domain: str) -> dict:
+    """대기 목록 행(HTML 조각들) → 문서 번호·내 결재 칸 번호·제목 등."""
+    no = re.search(r'value="(\d+)"', x.get("checkbox") or "")
+    doc = re.search(r"getView\('(\d+)'", f"{x.get('title') or ''} {x.get('link') or ''}")
+    if not (no and doc):
+        raise HiworksError("결재 대기 목록 형식이 바뀌었습니다(결재 칸·문서 번호를 찾지 못함).")
+    return {"document_no": int(doc[1]), "approval_no": int(no[1]), "code": _text(x.get("document_code")),
+            "title": _text(x.get("title")), "drafter": _text(x.get("register")), "my_role": _text(x.get("type")),
+            "drafted": x.get("document_regdate_title") or x.get("document_regdate"),
+            "url": f"{APPROVAL_ORIGIN}/{domain}/approval/document/view/{doc[1]}"}
 
 
 def summarize_document(x: dict, domain: str) -> dict:
@@ -1332,10 +1402,29 @@ def run_api_command(hw: "Hiworks", a) -> int:
         y, mo = map(int, ym.split("-"))
         emit({"month": ym, "periods": hw.vacation_calendar(y, mo, name=a.name, department=a.dept)})
     elif a.cmd == "approval":
+        if a.action in ("line", "approve") and not a.document_no:
+            raise HiworksError(f"approval {a.action} 에는 문서 번호가 필요합니다.")
         if a.action == "line":
-            if not a.document_no:
-                raise HiworksError("approval line 에는 문서 번호가 필요합니다.")
-            emit(hw.approval_line(a.document_no))
+            emit(hw.approval_line(a.document_no[0]))
+        elif a.action == "pending":
+            emit(hw.approval_pending())
+        elif a.action == "approve" and not a.yes:
+            pending = {x["document_no"]: x for x in hw.approval_pending()["items"]}
+            preview = []
+            for n in dict.fromkeys(a.document_no):
+                item = dict(pending.get(n) or {"document_no": n, "error": "지금 내가 결재할 차례인 문서가 아닙니다"})
+                if n in pending:
+                    try:
+                        item["approval_line"] = hw.approval_line(n)["lines"]
+                    except HiworksError as e:
+                        item["approval_line_error"] = str(e)
+                preview.append(item)
+            emit({"preview": preview, "note": "승인하지 않았습니다. 사용자가 확인한 뒤에만 --yes 를 붙여 승인합니다."})
+            return 0 if all("error" not in x for x in preview) else 1
+        elif a.action == "approve":
+            out = hw.approve_documents(a.document_no)
+            emit(out)
+            return 0 if not out["not_approved"] else 1
         else:
             emit(hw.approval_counts() if a.action == "count"
                  else hw.approval_documents(a.box, a.status, a.search, a.limit, a.offset))
@@ -1605,9 +1694,11 @@ def main() -> int:
     vh = sub.add_parser("vacation-history", help="내 휴가 신청 내역(JSON) — --lines 면 결재선도")
     vh.add_argument("--year", type=int, help="연도(기본 올해)")
     vh.add_argument("--lines", action="store_true", help="결재 문서의 결재선도 붙인다")
-    ap2 = sub.add_parser("approval", help="전자결재 — list 문서 목록·상태 · count 건수 · line <문서번호> 결재선")
-    ap2.add_argument("action", choices=["list", "count", "line"])
-    ap2.add_argument("document_no", nargs="?", type=int, help="line 때 문서 번호")
+    ap2 = sub.add_parser("approval", help="전자결재 — list 문서 목록·상태 · count 건수 · line <문서번호> 결재선 · "
+                                           "pending 내 결재 차례 · approve <문서번호>... 승인(--yes 없으면 미리보기)")
+    ap2.add_argument("action", choices=["list", "count", "line", "pending", "approve"])
+    ap2.add_argument("document_no", nargs="*", type=int, help="line·approve 때 문서 번호(approve 는 여러 개 가능)")
+    ap2.add_argument("--yes", action="store_true", help="approve 를 실제로 한다(기안자·다음 결재자에게 알림이 간다)")
     ap2.add_argument("--box", default="all", help="all(기본)·writer 기안·approval 결재·refer 수신·read 회람/참조·reading 열람·return 반려·temp 임시저장")
     ap2.add_argument("--status", help="상태로 거르기 — 진행·완료·반려 등")
     ap2.add_argument("--search", help="제목·내용 등 검색어")
