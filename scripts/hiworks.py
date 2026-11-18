@@ -1086,12 +1086,13 @@ class Hiworks:
         결재 방식(예 BCF)의 글자 순서가 1·2·3번째 줄의 역할이다(B 신청·C 처리·F 참조 — 화면 코드 대조, 서버 문서는 없음)."""
         r = self._s.get(f"{APPROVAL_ORIGIN}/{self.office_domain}/approval/document/view/{int(document_no)}")
         h = r.body.decode("utf-8", "ignore")
-        lines = {k: v for k, v in approval_vars(h).items() if k.endswith("Line")}
+        allv = approval_vars(h)
+        lines = {k: v for k, v in allv.items() if k.endswith("Line")}
         if not lines:
             m = re.search(r'alert\("([^"]+)"\);\s*document\.location', h)
             raise HiworksError(f"문서 {document_no} 의 결재선을 읽지 못했습니다 — {m.group(1) if m else '보기 화면을 열 수 없음'}")
-        method = (re.search(r"ApprovalProcess\._approvalMethod = '([^']*)'", h) or [None, ""])[1]
-        register = (re.search(r"ApprovalProcess\._registerNo = '([^']*)'", h) or [None, ""])[1]
+        method = allv.get("approvalMethod", "")
+        register = allv.get("registerNo", "")
         d = self._directory()
         name = lambda no: (d["people"].get(int(no)) or {}).get("name") if str(no).isdigit() else None
         out = []
@@ -1317,11 +1318,24 @@ def _kdate(s: str) -> str | None:
     return f"{int(m[1]):04d}-{int(m[2]):02d}-{int(m[3]):02d}" if m else None
 
 
+CONTENT_START = 'class="contents after"'
+CONTENT_END = 'id="approvalCommentsTab"'
+_VAR = re.compile(r"ApprovalProcess\._(\w+) = '([^']*)'")
+
+
 def approval_vars(h: str) -> dict:
-    """문서 보기 화면의 ApprovalProcess._키 = '값'. 같은 키가 다른 값으로 두 번 나오면 멈춘다 —
-    기안자 본문에 같은 문장을 넣어 결재선·기안자를 바꿔치기하지 못하게(보안 검토 2026-11-18)."""
+    """문서 보기 화면의 ApprovalProcess._키 = '값' — 서버가 심는 스크립트(의견 탭 뒤)에서만 읽는다.
+    그 앞(머리 표·기안자 본문)에 같은 꼴이 하나라도 있거나 같은 키가 다른 값으로 두 번 나오면 멈춘다 —
+    기안자 본문으로 결재선·기안자를 바꿔치기하지 못하게(보안 검토 2026-11-18)."""
+    if h.count(CONTENT_END) > 1:
+        raise HiworksError("문서 화면에 의견 탭 표식이 둘 이상 있습니다 — 읽지 않습니다.")
+    tail = h.find(CONTENT_END)
+    if tail >= 0:
+        if _VAR.search(h[:tail]):
+            raise HiworksError("문서 본문에 결재 정보 꼴의 글이 있습니다 — 읽지 않습니다.")
+        h = h[tail:]
     out: dict[str, str] = {}
-    for k, v in re.findall(r"ApprovalProcess\._(\w+) = '([^']*)'", h):
+    for k, v in _VAR.findall(h):
         if k in out and out[k] != v:
             raise HiworksError(f"문서 화면에 결재 정보({k})가 서로 다르게 두 번 있습니다 — 읽지 않습니다.")
         out.setdefault(k, v)
@@ -1335,12 +1349,12 @@ def parse_document_view(h: str) -> dict | None:
     lines = approval_vars(h)
     if "firstLine" not in lines:
         return None
-    cut = h.find('class="contents after"')
-    if cut < 0:
-        raise HiworksError("문서 화면 형식이 바뀌었습니다(본문 영역을 찾지 못함) — 읽지 않습니다.")
-    head, rest = h[:cut], h[cut:]
-    tail = rest.find('id="approvalCommentsTab"')
-    content = rest if tail < 0 else rest[:tail]
+    if h.count(CONTENT_START) != 1 or h.count(CONTENT_END) != 1:
+        raise HiworksError("문서 화면 형식이 바뀌었거나 본문에 화면 표식이 들어 있습니다 — 읽지 않습니다.")
+    cut, tail = h.find(CONTENT_START), h.find(CONTENT_END)
+    if tail < cut:
+        raise HiworksError("문서 화면 형식이 바뀌었습니다(본문·의견 순서) — 읽지 않습니다.")
+    head, content = h[:cut], h[cut:]  # 휴가 표는 본문 시작부터 화면 끝까지 통틀어 하나여야 한다
     first = [x for x in lines.get("firstLine", "").split(",") if x.strip()]
     stamps = re.findall(r'<td class="stamp">([\s\S]*?)</td>', head)
     boxes = [{"hw": no, "processed": bool(re.search(r'<p class="date"[^>]*>\s*\d{4}-\d{2}-\d{2}', st))}

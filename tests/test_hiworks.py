@@ -975,6 +975,20 @@ class ApprovalDetailTests(ApiBase):
             d = hw.approval_detail(1000001)
         self.assertEqual([b["processed"] for b in d["boxes"]], [True, False, False])
 
+    def test_fake_comment_marker_cannot_hide_real_table(self):
+        fake = ('<table class="setting-table"><tbody><tr><td>연차</td><td>2027년 01월 01일(금)</td><td>1일</td></tr></tbody></table>'
+                '<div id="approvalCommentsTab"></div>')
+        self.serve(self.routes(detail_view(body_extra=fake)))
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            with self.assertRaises(hiworks.HiworksError):
+                hw.approval_detail(1000001)
+
+    def test_same_value_vars_in_body_refused(self):
+        self.serve(self.routes(detail_view(body_extra="ApprovalProcess._registerNo = '100';")))
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            with self.assertRaises(hiworks.HiworksError):
+                hw.approval_detail(1000001)
+
     def test_conflicting_approval_vars_refused(self):
         v = detail_view(body_extra="ApprovalProcess._registerNo = '999';")
         self.serve(self.routes(v))
