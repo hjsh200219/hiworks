@@ -1354,7 +1354,9 @@ def parse_document_view(h: str) -> dict | None:
     cut, tail = h.find(CONTENT_START), h.find(CONTENT_END)
     if tail < cut:
         raise HiworksError("문서 화면 형식이 바뀌었습니다(본문·의견 순서) — 읽지 않습니다.")
-    head, content = h[:cut], h[cut:]  # 휴가 표는 본문 시작부터 화면 끝까지 통틀어 하나여야 한다
+    head, content = h[:cut], h[cut:tail]  # 휴가 표는 본문 영역에서만 — 의견 영역 표는 쓰지 않는다
+    if '<table class="setting-table">' in h[tail:]:
+        raise HiworksError("문서 의견 영역에 휴가 신청 표 꼴이 있습니다 — 읽지 않습니다.")
     first = [x for x in lines.get("firstLine", "").split(",") if x.strip()]
     stamps = re.findall(r'<td class="stamp">([\s\S]*?)</td>', head)
     boxes = [{"hw": no, "processed": bool(re.search(r'<p class="date"[^>]*>\s*\d{4}-\d{2}-\d{2}', st))}

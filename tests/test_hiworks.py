@@ -983,6 +983,17 @@ class ApprovalDetailTests(ApiBase):
             with self.assertRaises(hiworks.HiworksError):
                 hw.approval_detail(1000001)
 
+    def test_table_after_comment_tab_refused(self):
+        v = detail_view(rows=[("연차", "2026년 11월 27일(금)", "1일")]).replace(
+            '<table class="setting-table">', '<table class="x">', 1).replace(
+            '<div class="approval-comment-tab" id="approvalCommentsTab"></div>',
+            '<div class="approval-comment-tab" id="approvalCommentsTab"></div><table class="setting-table"><tbody>'
+            '<tr><td>연차</td><td>2027년 01월 01일(금)</td><td>1일</td></tr></tbody></table>')
+        self.serve(self.routes(v))
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            with self.assertRaises(hiworks.HiworksError):
+                hw.approval_detail(1000001)
+
     def test_same_value_vars_in_body_refused(self):
         self.serve(self.routes(detail_view(body_extra="ApprovalProcess._registerNo = '100';")))
         with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
