@@ -1086,7 +1086,7 @@ class Hiworks:
         결재 방식(예 BCF)의 글자 순서가 1·2·3번째 줄의 역할이다(B 신청·C 처리·F 참조 — 화면 코드 대조, 서버 문서는 없음)."""
         r = self._s.get(f"{APPROVAL_ORIGIN}/{self.office_domain}/approval/document/view/{int(document_no)}")
         h = r.body.decode("utf-8", "ignore")
-        lines = dict(re.findall(r"ApprovalProcess\._(\w+Line) = '([^']*)'", h))
+        lines = {k: v for k, v in approval_vars(h).items() if k.endswith("Line")}
         if not lines:
             m = re.search(r'alert\("([^"]+)"\);\s*document\.location', h)
             raise HiworksError(f"문서 {document_no} 의 결재선을 읽지 못했습니다 — {m.group(1) if m else '보기 화면을 열 수 없음'}")
@@ -1317,34 +1317,54 @@ def _kdate(s: str) -> str | None:
     return f"{int(m[1]):04d}-{int(m[2]):02d}-{int(m[3]):02d}" if m else None
 
 
+def approval_vars(h: str) -> dict:
+    """문서 보기 화면의 ApprovalProcess._키 = '값'. 같은 키가 다른 값으로 두 번 나오면 멈춘다 —
+    기안자 본문에 같은 문장을 넣어 결재선·기안자를 바꿔치기하지 못하게(보안 검토 2026-11-18)."""
+    out: dict[str, str] = {}
+    for k, v in re.findall(r"ApprovalProcess\._(\w+) = '([^']*)'", h):
+        if k in out and out[k] != v:
+            raise HiworksError(f"문서 화면에 결재 정보({k})가 서로 다르게 두 번 있습니다 — 읽지 않습니다.")
+        out.setdefault(k, v)
+    return out
+
+
 def parse_document_view(h: str) -> dict | None:
-    """문서 보기 화면 HTML → 상세(사유·제목 제외). 결재선이 없으면 None(열 수 없는 문서)."""
-    lines = dict(re.findall(r"ApprovalProcess\._(\w+) = '([^']*)'", h))
+    """문서 보기 화면 HTML → 상세(사유·제목 제외). 결재선이 없으면 None(열 수 없는 문서).
+    결재 칸·문서 정보는 본문(contents after — 기안자가 쓰는 영역) 앞의 고정 영역에서만 읽고,
+    휴가 신청 표는 본문 안에 정확히 하나일 때만 쓴다."""
+    lines = approval_vars(h)
     if "firstLine" not in lines:
         return None
+    cut = h.find('class="contents after"')
+    if cut < 0:
+        raise HiworksError("문서 화면 형식이 바뀌었습니다(본문 영역을 찾지 못함) — 읽지 않습니다.")
+    head, rest = h[:cut], h[cut:]
+    tail = rest.find('id="approvalCommentsTab"')
+    content = rest if tail < 0 else rest[:tail]
     first = [x for x in lines.get("firstLine", "").split(",") if x.strip()]
-    stamps = re.findall(r'<td class="stamp">([\s\S]*?)</td>', h)
+    stamps = re.findall(r'<td class="stamp">([\s\S]*?)</td>', head)
     boxes = [{"hw": no, "processed": bool(re.search(r'<p class="date"[^>]*>\s*\d{4}-\d{2}-\d{2}', st))}
-             for no, st in zip(first, stamps)]
-    kind_cell = re.search(r"<th[^>]*>문서 종류</th>\s*<td[^>]*>([\s\S]*?)</td>", h)
+             for no, st in zip(first, stamps)] if len(stamps) >= len(first) else []
+    kind_cell = re.search(r"<th[^>]*>문서 종류</th>\s*<td[^>]*>([\s\S]*?)</td>", head)
     form = _text(kind_cell[1]).split(">")[-1].strip() if kind_cell else None
-    code_cell = re.search(r"<th[^>]*>문서 번호</th>\s*<td[^>]*>([\s\S]*?)</td>", h)
-    done_cell = re.search(r"<th[^>]*>완료 일시</th>\s*<td[^>]*>([\s\S]*?)</td>", h)
+    code_cell = re.search(r"<th[^>]*>문서 번호</th>\s*<td[^>]*>([\s\S]*?)</td>", head)
+    done_cell = re.search(r"<th[^>]*>완료 일시</th>\s*<td[^>]*>([\s\S]*?)</td>", head)
     out = {"form": form, "leave_kind": None, "start": None, "end": None, "start_time": None, "end_time": None,
-           "days": None, "person": lines.get("_registerNo") or lines.get("registerNo"), "boxes": boxes,
+           "days": None, "person": lines.get("registerNo"), "boxes": boxes,
            "turn_hw": next((b["hw"] for b in boxes if not b["processed"]), None),
            "_complete": bool(done_cell and _text(done_cell[1])), "_code": _text(code_cell[1]) if code_cell else ""}
     if form == "휴가신청서" or lines.get("documentType") == "hr_vacation":
-        table = re.search(r'<table class="setting-table">([\s\S]*?)</table>', h)
-        rows = re.findall(r"<tr>\s*<td>([\s\S]*?)</td>\s*<td>([\s\S]*?)</td>\s*<td>([\s\S]*?)</td>", table[1]) if table else []
+        tables = re.findall(r'<table class="setting-table">([\s\S]*?)</table>', content)
+        if len(tables) > 1:
+            raise HiworksError("문서 본문에 휴가 신청 표가 둘 이상 있습니다 — 어느 것이 진짜인지 몰라 읽지 않습니다.")
+        rows = re.findall(r"<tr>\s*<td>([\s\S]*?)</td>\s*<td>([\s\S]*?)</td>\s*<td>([\s\S]*?)</td>", tables[0]) if tables else []
         if rows:
             kinds, dates, days = [], [], 0.0
             st_t = en_t = None
             for k, when, n in rows:
                 kinds.append(_text(k))
                 w = _text(when)
-                ds = re.findall(r"\d{4}년\s*\d{1,2}월\s*\d{1,2}일", w)
-                dates += [_kdate(x) for x in ds]
+                dates += [_kdate(x) for x in re.findall(r"\d{4}년\s*\d{1,2}월\s*\d{1,2}일", w)]
                 ts = re.findall(r"(\d{2}:\d{2})", w)
                 if len(ts) >= 2:
                     st_t, en_t = ts[0], ts[-1]
@@ -1490,6 +1510,9 @@ def run_api_command(hw: "Hiworks", a) -> int:
         emit(hw.my_vacation())
     elif a.cmd == "org":
         emit(hw.org_chart())
+    elif a.cmd == "whoami":
+        me = hw.me()
+        emit({"office_user_no": me["office_user_no"], "user_id": me["user_id"]})
     elif a.cmd == "person":
         emit(hw.find_people(a.query))
     elif a.cmd == "leave-calendar":
@@ -1775,6 +1798,7 @@ def main() -> int:
     lc.add_argument("--name", help="이름(부분 일치)")
     lc.add_argument("--dept", help="부서 이름(부분 일치) 또는 id")
     sub.add_parser("org", help="조직도 — 부서 트리와 구성원(JSON)")
+    sub.add_parser("whoami", help="로그인한 본인의 사람 번호(office_user_no)·아이디(JSON)")
     pp = sub.add_parser("person", help="직원 찾기 — 이름·아이디·영문 이름 부분 일치(JSON)")
     pp.add_argument("query")
     vl = sub.add_parser("vacation-line", help="휴가 결재선 저장 — 휴가 신청 때 자동으로 들어간다")
@@ -1866,7 +1890,7 @@ def main() -> int:
                 print(f"로그인 성공 · {hw.username} · 세션 {hw.session_path}")
                 return 0
             how = hw.ensure(otp)
-            if a.cmd in ("mail", "vacation", "leave-calendar", "org", "person", "vacation-request", "work",
+            if a.cmd in ("mail", "vacation", "leave-calendar", "org", "whoami", "person", "vacation-request", "work",
                          "approval", "vacation-line", "vacation-history", "calendar", "vacation-cancel", "today"):
                 return run_api_command(hw, a)
             if a.cmd == "session":

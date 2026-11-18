@@ -37,6 +37,7 @@ allowed-tools: Bash(uv run:*)
 | `HW work status` · `HW work in\|out [--yes]` | 근무 체크 상태 · 출근/퇴근 기록(지금 시각). **`--yes` 없으면 미리보기만** | GET·POST |
 | `HW approval list [--box all\|writer\|approval\|refer\|read\|reading\|return\|temp] [--status 진행\|완료\|반려] [--search 말]` · `HW approval count` | 전자결재 내 문서 목록과 상태 · 결재할 문서 수 | GET |
 | `HW approval pending` | 지금 내가 결재할 차례인 문서(웹 「대기」) — 문서 번호·제목·기안자 | POST |
+| `HW whoami` | 로그인한 본인의 사람 번호·아이디 | GET |
 | `HW approval detail <문서번호>` | 문서 상세 — 양식·휴가 종류·기간(날짜·시각)·일수·기안자 사람 번호·문서 상태(진행·완료·반려·회수)·결재 칸별 처리 여부(`boxes`, 도장 칸 날짜 기준)·다음 차례(`turn_hw`). 제목·사유는 돌려주지 않는다 | GET |
 | `HW approval approve <문서번호>... [--yes]` | 대기 문서 승인. **`--yes` 없으면 미리보기(제목·기안자·결재선)만** — 아래 「결재 승인 규칙」. 결과의 승인 행에 `my_box`(내 결재 칸 도장 날짜로 확인한 처리 여부 — 못 읽으면 null)·`doc_state` | POST |
 | `HW person <이름\|아이디>` | 직원 찾기 — 부서·직위·회사 전화, 본인이 공개한 경우만 휴대폰·이메일·입사일 | GET |

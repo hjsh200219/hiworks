@@ -899,22 +899,25 @@ class TodayTests(ApiBase):
         self.assertEqual([x["name"] for x in out["team_on_leave"]], ["동료"])
 
 
-def detail_view(no=1000001, stamps=("2026-11-10", "2026-11-10", ""), complete="", rows=None, form="공통 > 휴가신청서"):
-    """합성 문서 보기 화면 — 실제 화면 구조(결재 칸 td.stamp·p.date, ApprovalProcess 값, 신청 내역 표)만 본뜸."""
+def detail_view(no=1000001, stamps=("2026-11-10", "2026-11-10", ""), complete="", rows=None, form="공통 > 휴가신청서",
+                body_extra="", script_extra=""):
+    """합성 문서 보기 화면 — 실제 화면 순서(머리 표·결재 칸 → 본문 contents after → 의견 탭 → ApprovalProcess 스크립트)만 본뜸."""
     rows = rows or [("연차", "2026년 11월 27일(금) ~ 2026년 12월 02일(수)", "4일")]
     st = "".join(f'<td class="stamp"> <img src="/x.com/approval/sign/approval/B/2/{n}" alt="가">'
                  + (f'<p class="date" title="{d} 10:00:00">{d} </p>' if d else "") + " </td>"
                  for n, d in zip((100, 200, 300), stamps))
     body = "".join(f"<tr><td>{a}</td><td>{b}</td><td>{c}</td></tr>" for a, b, c in rows)
-    return (f"<script>ApprovalProcess._documentNo = '{no}'; ApprovalProcess._firstLine = '100,200,300'; "
-            "ApprovalProcess._secondLine = ''; ApprovalProcess._thirdLine = '400'; ApprovalProcess._approvalMethod = 'BCF'; "
-            "ApprovalProcess._registerNo = '100'; ApprovalProcess._documentType = 'hr_vacation';</script>"
-            f"<h1>휴가신청서</h1><table><tr><th>문서 종류</th><td>{form}</td><th>문서 번호</th>"
+    return (f"<h1>휴가신청서</h1><table><tr><th>문서 종류</th><td>{form}</td><th>문서 번호</th>"
             f"<td class=\"gt-pr-10\">X-휴가-1</td></tr><tr><th>기안 일시</th><td>2026-11-10 10:00:00</td>"
             f"<th>완료 일시</th><td>{complete}</td></tr></table>"
             f"<table><tr>{st}<td class=\"stamp\"> </td></tr></table>"
-            '<div class="hw-approval-docs"><section><div class="section-title">사유</div><div class="section-data">개인 사유 문장</div></section>'
-            f'<table class="setting-table"><thead><tr><th>휴가 종류</th><th>신청일</th><th>일수</th></tr></thead><tbody>{body}</tbody></table></div>')
+            '<div class="contents after"><div class="hw-approval-docs"><section><div class="section-title">사유</div>'
+            f'<div class="section-data">개인 사유 문장{body_extra}</div></section>'
+            f'<table class="setting-table"><thead><tr><th>휴가 종류</th><th>신청일</th><th>일수</th></tr></thead><tbody>{body}</tbody></table></div></div>'
+            '<div class="approval-comment-tab" id="approvalCommentsTab"></div>'
+            f"<script>ApprovalProcess._documentNo = '{no}'; ApprovalProcess._firstLine = '100,200,300'; "
+            "ApprovalProcess._secondLine = ''; ApprovalProcess._thirdLine = '400'; ApprovalProcess._approvalMethod = 'BCF'; "
+            f"ApprovalProcess._registerNo = '100'; ApprovalProcess._documentType = 'hr_vacation';{script_extra}</script>")
 
 
 class ApprovalDetailTests(ApiBase):
@@ -958,6 +961,32 @@ class ApprovalDetailTests(ApiBase):
         with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
             d = hw.approval_detail(1000001)
         self.assertEqual((d["form"], d["leave_kind"], d["start"]), ("지출결의서", None, None))
+
+    def test_body_cannot_forge_stamps_or_dates(self):
+        # 기안자 본문에 가짜 도장 칸·휴가 표를 넣어도 결재 칸·기간은 고정 영역에서만 읽는다(보안 검토 2026-11-18)
+        fake = ('<table><tr><td class="stamp"><p class="date">2026-11-18 </p></td></tr></table>'
+                '<table class="setting-table"><tbody><tr><td>연차</td><td>2027년 01월 01일(금)</td><td>1일</td></tr></tbody></table>')
+        self.serve(self.routes(detail_view(stamps=("2026-11-10", "", ""), body_extra=fake)))
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            with self.assertRaises(hiworks.HiworksError):  # 본문 안 휴가 표가 둘 — 어느 것이 진짜인지 몰라 멈춤
+                hw.approval_detail(1000001)
+        self.serve(self.routes(detail_view(stamps=("2026-11-10", "", ""), body_extra=fake[:fake.index("<table class")])))
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            d = hw.approval_detail(1000001)
+        self.assertEqual([b["processed"] for b in d["boxes"]], [True, False, False])
+
+    def test_conflicting_approval_vars_refused(self):
+        v = detail_view(body_extra="ApprovalProcess._registerNo = '999';")
+        self.serve(self.routes(v))
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            with self.assertRaises(hiworks.HiworksError):
+                hw.approval_detail(1000001)
+
+    def test_whoami_returns_person_number(self):
+        self.serve({"GET /me": FakeResponse(200, {"data": {"name": "가나", "user_id": "u1", "office_user_no": "300"}})})
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            me = hw.me()
+        self.assertEqual((me["office_user_no"], me["user_id"]), (300, "u1"))
 
     def test_approve_reports_my_box(self):
         state = {"done": False}
