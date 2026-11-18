@@ -66,6 +66,7 @@ $HW vacation-line set --approver 팀장 --ref 동료           # 휴가 결재�
 $HW work status | $HW work in --yes | $HW work out --yes   # 근무 체크(지금 시각으로 기록)
 $HW approval list [--box writer] [--status 진행]           # 전자결재 내 문서·상태 · approval count
 $HW approval pending                                       # 지금 내가 결재할 차례인 문서
+$HW approval detail <문서번호>                              # 양식·기간·일수·기안자 번호·문서 상태·결재 칸별 처리(제목·사유 없음)
 $HW approval approve <문서번호> [--yes]                     # 승인(--yes 없으면 미리보기 — 확인 뒤에만 --yes)
 $HW today                                                  # 아침 요약
 $HW mail send --to a@x.com --subject 제목 --body 본문 --attach 파일 --yes   # 첨부 · --reply-to/--forward 번호

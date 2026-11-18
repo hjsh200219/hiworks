@@ -668,8 +668,9 @@ class ApprovalPendingTests(ApiBase):
         srv = self.server()
         with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
             out = hw.approve_documents([7])
-        action = [c[2] for c in srv.calls if c[2].get("pMenu") == "approval_action"]
+        action = [c[2] for c in srv.calls if isinstance(c[2], dict) and c[2].get("pMenu") == "approval_action"]
         self.assertEqual([a["pNo[]"] for a in action], [["55"]])  # 문서 번호가 아니라 내 결재 칸 번호
+        self.assertIsNone(out["approved"][0]["my_box"])  # 상세를 못 읽으면 처리 여부를 모른다(성공으로 치지 않음)
         self.assertEqual(([x["document_no"] for x in out["approved"]], out["not_approved"]), ([7], []))
 
     def test_document_not_waiting_sends_nothing(self):
@@ -896,6 +897,91 @@ class TodayTests(ApiBase):
         self.assertEqual(out["unread_mail"]["count_in_latest_50"], 1)
         self.assertIn("error", out["approval"])
         self.assertEqual([x["name"] for x in out["team_on_leave"]], ["동료"])
+
+
+def detail_view(no=1000001, stamps=("2026-11-10", "2026-11-10", ""), complete="", rows=None, form="공통 > 휴가신청서"):
+    """합성 문서 보기 화면 — 실제 화면 구조(결재 칸 td.stamp·p.date, ApprovalProcess 값, 신청 내역 표)만 본뜸."""
+    rows = rows or [("연차", "2026년 11월 27일(금) ~ 2026년 12월 02일(수)", "4일")]
+    st = "".join(f'<td class="stamp"> <img src="/x.com/approval/sign/approval/B/2/{n}" alt="가">'
+                 + (f'<p class="date" title="{d} 10:00:00">{d} </p>' if d else "") + " </td>"
+                 for n, d in zip((100, 200, 300), stamps))
+    body = "".join(f"<tr><td>{a}</td><td>{b}</td><td>{c}</td></tr>" for a, b, c in rows)
+    return (f"<script>ApprovalProcess._documentNo = '{no}'; ApprovalProcess._firstLine = '100,200,300'; "
+            "ApprovalProcess._secondLine = ''; ApprovalProcess._thirdLine = '400'; ApprovalProcess._approvalMethod = 'BCF'; "
+            "ApprovalProcess._registerNo = '100'; ApprovalProcess._documentType = 'hr_vacation';</script>"
+            f"<h1>휴가신청서</h1><table><tr><th>문서 종류</th><td>{form}</td><th>문서 번호</th>"
+            f"<td class=\"gt-pr-10\">X-휴가-1</td></tr><tr><th>기안 일시</th><td>2026-11-10 10:00:00</td>"
+            f"<th>완료 일시</th><td>{complete}</td></tr></table>"
+            f"<table><tr>{st}<td class=\"stamp\"> </td></tr></table>"
+            '<div class="hw-approval-docs"><section><div class="section-title">사유</div><div class="section-data">개인 사유 문장</div></section>'
+            f'<table class="setting-table"><thead><tr><th>휴가 종류</th><th>신청일</th><th>일수</th></tr></thead><tbody>{body}</tbody></table></div>')
+
+
+class ApprovalDetailTests(ApiBase):
+    def routes(self, view, status="PROGRESS", no=1000001):
+        r = {f"GET /approval/document/view/{no}": FakeResponse(200, ""),
+             "GET /my-documents": FakeResponse(200, {"data": [{"id": no, "document_code": "X-휴가-1",
+                                                              "list_status": status, "complete_date": None}]})}
+        r[f"GET /approval/document/view/{no}"].body = view.encode()
+        return r
+
+    def test_progress_document_fields_and_boxes(self):
+        self.serve(self.routes(detail_view()))
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            d = hw.approval_detail(1000001)
+        self.assertEqual((d["form"], d["leave_kind"], d["start"], d["end"], d["days"], d["person"], d["doc_state"]),
+                         ("휴가신청서", "연차", "2026-11-27", "2026-12-02", 4.0, "100", "진행"))
+        self.assertEqual(d["boxes"], [{"hw": "100", "processed": True}, {"hw": "200", "processed": True},
+                                      {"hw": "300", "processed": False}])
+        self.assertEqual(d["turn_hw"], "300")
+        self.assertNotIn("사유", json.dumps(d, ensure_ascii=False))  # 사유·제목은 돌려주지 않는다
+
+    def test_complete_and_return_states(self):
+        self.serve(self.routes(detail_view(stamps=("2026-11-10",) * 3, complete="2026-11-11 09:00:00"), status=None))
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            self.assertEqual(hw.approval_detail(1000001)["doc_state"], "완료")
+        self.serve(self.routes(detail_view(stamps=("2026-11-10", "", "")), status="RETURN"))
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            d = hw.approval_detail(1000001)
+        self.assertEqual((d["doc_state"], d["turn_hw"]), ("반려", None))
+
+    def test_half_day_times(self):
+        self.serve(self.routes(detail_view(rows=[("오전반차", "2026년 11월 26일(목) 09:00 ~ 13:00", "0.5일")])))
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            d = hw.approval_detail(1000001)
+        self.assertEqual((d["leave_kind"], d["start"], d["end"], d["start_time"], d["end_time"], d["days"]),
+                         ("오전반차", "2026-11-26", "2026-11-26", "09:00", "13:00", 0.5))
+
+    def test_non_leave_form(self):
+        v = detail_view(form="공통 > 지출결의서").replace("hr_vacation", "expense")
+        self.serve(self.routes(v))
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            d = hw.approval_detail(1000001)
+        self.assertEqual((d["form"], d["leave_kind"], d["start"]), ("지출결의서", None, None))
+
+    def test_approve_reports_my_box(self):
+        state = {"done": False}
+        pending_row = {"checkbox": '<label><input type="checkbox" class="js-checkbox-approval-lists" value="77"></label>',
+                       "link": "javascript:ApprovalDocument.getView('1000001')", "title": "t", "register": "r"}
+
+        def pending(_kw):
+            return FakeResponse(200, {"resultCode": "SUCCESS", "result": [] if state["done"] else [pending_row]})
+
+        def action(kw):
+            if kw["data"].get("pMenu") == "approval_action":
+                state["done"] = True
+                return FakeResponse(200, {"resultCode": "SUCCESS", "message": "ok"})
+            return pending(kw)
+
+        r = self.routes(detail_view(stamps=("2026-11-10", "2026-11-10", "2026-11-18")))
+        r["POST /approval/document_ajax"] = action
+        r["GET /v1/employees/me"] = FakeResponse(200, {"data": {"id": 300}})
+        self.serve(r)
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            with patch.object(hiworks.Hiworks, "_my_person_no", return_value="300"):
+                out = hw.approve_documents([1000001])
+        self.assertEqual(out["approved"][0]["my_box"], True)
+        self.assertEqual(out["approved"][0]["doc_state"], "진행")
 
 
 if __name__ == "__main__":
