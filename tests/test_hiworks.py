@@ -948,6 +948,21 @@ class ApprovalDetailTests(ApiBase):
             d = hw.approval_detail(1000001)
         self.assertEqual((d["doc_state"], d["turn_hw"]), ("반려", None))
 
+    def test_progress_view_without_kind_cell_uses_document_type(self):
+        # 실측 2026-11-18: 진행 중 휴가 문서 보기 화면에 머리 「문서 종류」 칸이 없어 form 이 None 이었다 —
+        # 신뢰 영역의 결재 변수 documentType=hr_vacation 으로 휴가신청서를 판정한다
+        v = detail_view().replace("<th>문서 종류</th><td>공통 > 휴가신청서</td>", "")
+        self.serve(self.routes(v))
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            d = hw.approval_detail(1000001)
+        self.assertEqual((d["form"], d["leave_kind"], d["doc_state"]), ("휴가신청서", "연차", "진행"))
+
+    def test_kind_cell_absent_and_not_vacation_stays_none(self):
+        v = detail_view().replace("<th>문서 종류</th><td>공통 > 휴가신청서</td>", "").replace("hr_vacation", "expense")
+        self.serve(self.routes(v))
+        with hiworks.Hiworks(username="a@x.com", password="pw") as hw:
+            self.assertIsNone(hw.approval_detail(1000001)["form"])
+
     def test_half_day_times(self):
         self.serve(self.routes(detail_view(rows=[("오전반차", "2026년 11월 26일(목) 09:00 ~ 13:00", "0.5일")])))
         with hiworks.Hiworks(username="a@x.com", password="pw") as hw:

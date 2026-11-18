@@ -1363,6 +1363,8 @@ def parse_document_view(h: str) -> dict | None:
              for no, st in zip(first, stamps)] if len(stamps) >= len(first) else []
     kind_cell = re.search(r"<th[^>]*>문서 종류</th>\s*<td[^>]*>([\s\S]*?)</td>", head)
     form = _text(kind_cell[1]).split(">")[-1].strip() if kind_cell else None
+    if form is None and lines.get("documentType") == "hr_vacation":
+        form = "휴가신청서"  # 진행 중 문서 화면엔 「문서 종류」 칸이 없다(2026-11-18 실측) — 신뢰 영역의 결재 변수로 판정
     code_cell = re.search(r"<th[^>]*>문서 번호</th>\s*<td[^>]*>([\s\S]*?)</td>", head)
     done_cell = re.search(r"<th[^>]*>완료 일시</th>\s*<td[^>]*>([\s\S]*?)</td>", head)
     out = {"form": form, "leave_kind": None, "start": None, "end": None, "start_time": None, "end_time": None,
